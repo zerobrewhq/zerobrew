@@ -75,16 +75,34 @@ impl Brew {
     }
 
     /// Install `formula` and return its keg path.
+    /// Install `formula` at the version the API currently serves and return
+    /// its keg path.
+    ///
+    /// CI runners ship a Homebrew with a stale API cache and some formulae
+    /// preinstalled, so a plain `brew install` can be a no-op at an older
+    /// version than the one zb resolves. Refresh the API first and upgrade
+    /// whatever is already there. A reference Homebrew named by
+    /// `ZB_PARITY_BREW` is treated as pinned and is not updated.
     fn install(&self, formula: &str) -> PathBuf {
+        if std::env::var_os("ZB_PARITY_BREW").is_none() {
+            assert_success(&self.run(&["update", "--quiet"]), "brew update");
+        }
         assert_success(
             &self.run(&["install", "--formula", formula]),
             &format!("brew install {formula}"),
         );
-        let cellar = PathBuf::from(stdout(
-            &self.run(&["--cellar", formula]),
-            &format!("brew --cellar {formula}"),
+        // No-op when the install above was fresh or already current.
+        assert_success(
+            &self.run(&["upgrade", "--formula", formula]),
+            &format!("brew upgrade {formula}"),
+        );
+        // `opt/<formula>` points at the current keg even when older
+        // versions are still in the Cellar.
+        let opt = PathBuf::from(stdout(
+            &self.run(&["--prefix", formula]),
+            &format!("brew --prefix {formula}"),
         ));
-        single_version_dir(&cellar)
+        fs::canonicalize(&opt).unwrap_or_else(|e| panic!("cannot resolve {}: {e}", opt.display()))
     }
 }
 
@@ -325,7 +343,7 @@ fn xz_keg_matches_homebrew() {
     let zb = Zb::new();
 
     let reference_keg = brew.install("xz");
-    let keg = zb.install("xz");
+    let keg = fs::canonicalize(zb.install("xz")).unwrap();
     assert_eq!(
         reference_keg.file_name(),
         keg.file_name(),
