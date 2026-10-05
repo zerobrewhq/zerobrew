@@ -1,0 +1,60 @@
+# Installs the same formulae with Homebrew and with zb on the same runner and
+# compares what landed on disk. Homebrew is the reference, so a failure here
+# means zb wrote something Homebrew would not have, or Homebrew changed.
+# See https://github.com/zerobrewhq/zerobrew/issues/421.
+name: parity
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'zb_core/**'
+      - 'zb_io/**'
+      - 'zb_cli/**'
+      - 'Cargo.lock'
+      - '.github/workflows/parity.yml'
+  pull_request:
+    paths:
+      - 'zb_core/**'
+      - 'zb_io/**'
+      - 'zb_cli/**'
+      - 'Cargo.lock'
+      - '.github/workflows/parity.yml'
+  schedule:
+    # Nightly, so drift on Homebrew's side is caught even when nothing is pushed.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: parity-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  parity:
+    name: macos-arm64 / rust ${{ matrix.rust }}
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        rust: ["1.96"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: cache rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-latest-${{ matrix.rust }}
+
+      - name: homebrew version
+        run: brew --version
+
+      # The runner ships Homebrew. REQUIRE_BREW turns a missing one into a
+      # failure instead of a silent skip.
+      - name: run parity tests
+        env:
+          ZB_PARITY_REQUIRE_BREW: "1"
+        run: cargo test --package zb_cli --test parity -- --nocapture
