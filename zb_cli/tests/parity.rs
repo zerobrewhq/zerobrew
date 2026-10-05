@@ -1,0 +1,424 @@
+//! Parity tests: install the same formula with Homebrew and with zerobrew, then
+//! compare what landed on disk. Homebrew is the reference implementation, so
+//! anything zerobrew writes differently is a bug unless it is on the allowlist.
+//!
+//! Needs a `brew` on `PATH`, or one named by `ZB_PARITY_BREW`. Without one the
+//! tests skip, unless `ZB_PARITY_REQUIRE_BREW` is set, in which case they fail.
+//! CI sets that so a missing Homebrew can't silently turn the suite off.
+//!
+//! macOS only for now: binaries are compared through `otool` and `codesign`.
+#![cfg(target_os = "macos")]
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+/// Files Homebrew writes into a keg that zerobrew doesn't, or writes differently.
+/// Each entry says why.
+const KEG_ALLOWLIST: &[(&str, &str)] = &[
+    (
+        "INSTALL_RECEIPT.json",
+        "zerobrew records installs in its database instead of a receipt",
+    ),
+    (
+        "sbom.spdx.json",
+        "Homebrew regenerates the bottle's SBOM at install time with a timestamp",
+    ),
+];
+
+struct Brew {
+    bin: PathBuf,
+    prefix: PathBuf,
+}
+
+impl Brew {
+    /// The reference Homebrew, or `None` when there isn't one and the test may skip.
+    fn find() -> Option<Self> {
+        let bin = std::env::var_os("ZB_PARITY_BREW")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("PATH").and_then(|path| {
+                    std::env::split_paths(&path)
+                        .map(|dir| dir.join("brew"))
+                        .find(|candidate| candidate.is_file())
+                })
+            });
+        let Some(bin) = bin else {
+            if std::env::var_os("ZB_PARITY_REQUIRE_BREW").is_some() {
+                panic!(
+                    "ZB_PARITY_REQUIRE_BREW is set but no `brew` was found on PATH or in ZB_PARITY_BREW"
+                );
+            }
+            eprintln!("skipping: no `brew` on PATH and ZB_PARITY_BREW is unset");
+            return None;
+        };
+        let prefix = PathBuf::from(stdout(&Self::command(&bin, &["--prefix"]), "brew --prefix"));
+        Some(Self { bin, prefix })
+    }
+
+    fn command(bin: &Path, args: &[&str]) -> Output {
+        Command::new(bin)
+            .args(args)
+            .env("HOMEBREW_NO_ANALYTICS", "1")
+            .env("HOMEBREW_NO_AUTO_UPDATE", "1")
+            .env("HOMEBREW_NO_ENV_HINTS", "1")
+            .env("HOMEBREW_NO_INSTALL_CLEANUP", "1")
+            .env("HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK", "1")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {}: {e}", bin.display()))
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Self::command(&self.bin, args)
+    }
+
+    /// Install `formula` and return its keg path.
+    fn install(&self, formula: &str) -> PathBuf {
+        assert_success(
+            &self.run(&["install", "--formula", formula]),
+            &format!("brew install {formula}"),
+        );
+        let cellar = PathBuf::from(stdout(
+            &self.run(&["--cellar", formula]),
+            &format!("brew --cellar {formula}"),
+        ));
+        single_version_dir(&cellar)
+    }
+}
+
+struct Zb {
+    root: tempfile::TempDir,
+    /// Short on purpose: Mach-O patching needs a prefix no longer than
+    /// `/opt/homebrew`, and the default temp dir on macOS is far longer.
+    prefix_dir: tempfile::TempDir,
+}
+
+impl Zb {
+    fn new() -> Self {
+        Self {
+            root: tempfile::TempDir::new().expect("failed to create temp dir"),
+            prefix_dir: tempfile::Builder::new()
+                .prefix("zb")
+                .rand_bytes(3)
+                .tempdir_in("/tmp")
+                .expect("failed to create short prefix temp dir"),
+        }
+    }
+
+    fn prefix(&self) -> PathBuf {
+        self.prefix_dir.path().to_path_buf()
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        let zb = env!("CARGO_BIN_EXE_zb");
+        Command::new(zb)
+            .env("ZEROBREW_ROOT", self.root.path())
+            .env("ZEROBREW_PREFIX", self.prefix())
+            .env("ZEROBREW_AUTO_INIT", "true")
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {zb}: {e}"))
+    }
+
+    fn install(&self, formula: &str) -> PathBuf {
+        assert_success(
+            &self.run(&["install", formula]),
+            &format!("zb install {formula}"),
+        );
+        single_version_dir(&self.prefix().join("Cellar").join(formula))
+    }
+}
+
+/// Everything about a file that should match between the two installs.
+#[derive(Debug, PartialEq, Eq)]
+enum Entry {
+    Dir,
+    Symlink(String),
+    File {
+        mode: u32,
+        content: Vec<u8>,
+    },
+    /// Mach-O binaries are compared by their load commands, not their bytes:
+    /// install names embed the prefix and the ad-hoc signature covers them.
+    MachO {
+        mode: u32,
+        load_commands: String,
+    },
+}
+
+/// Snapshot a directory tree, with the install prefix replaced by a marker so
+/// the two trees are comparable.
+fn snapshot(root: &Path, prefix: &Path) -> BTreeMap<String, Entry> {
+    let marker = "@PREFIX@";
+    let prefix_str = prefix.to_str().expect("prefix is not UTF-8");
+    let mut entries = BTreeMap::new();
+    for entry in walkdir::WalkDir::new(root).min_depth(1) {
+        let entry = entry.expect("failed to walk keg");
+        let rel = entry
+            .path()
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let meta = fs::symlink_metadata(entry.path()).expect("failed to stat");
+        let mode = meta.permissions().mode() & 0o7777;
+        let value = if meta.file_type().is_symlink() {
+            let target = fs::read_link(entry.path()).expect("failed to read link");
+            Entry::Symlink(target.to_string_lossy().replace(prefix_str, marker))
+        } else if meta.is_dir() {
+            Entry::Dir
+        } else if is_mach_o(entry.path()) {
+            Entry::MachO {
+                mode,
+                load_commands: mach_o_load_commands(entry.path()).replace(prefix_str, marker),
+            }
+        } else {
+            let content = fs::read(entry.path()).expect("failed to read file");
+            Entry::File {
+                mode,
+                content: replace_bytes(&content, prefix_str.as_bytes(), marker.as_bytes()),
+            }
+        };
+        entries.insert(rel, value);
+    }
+    entries
+}
+
+fn is_mach_o(path: &Path) -> bool {
+    let mut magic = [0_u8; 4];
+    std::io::Read::read_exact(
+        &mut match fs::File::open(path) {
+            Ok(file) => file,
+            Err(_) => return false,
+        },
+        &mut magic,
+    )
+    .is_ok()
+        && matches!(
+            magic,
+            [0xcf, 0xfa, 0xed, 0xfe] | [0xce, 0xfa, 0xed, 0xfe] | [0xca, 0xfe, 0xba, 0xbe]
+        )
+}
+
+/// Dylib ID, linked libraries and rpaths, as `otool` reports them.
+fn mach_o_load_commands(path: &Path) -> String {
+    let output = Command::new("otool")
+        .args(["-D", "-L", "-l"])
+        .arg(path)
+        .output()
+        .expect("failed to run otool");
+    assert!(
+        output.status.success(),
+        "otool failed on {}",
+        path.display()
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = Vec::new();
+    let mut in_rpath = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "cmd LC_RPATH" {
+            in_rpath = true;
+        } else if in_rpath && trimmed.starts_with("path ") {
+            lines.push(format!(
+                "rpath {}",
+                trimmed.split(" (offset").next().unwrap()
+            ));
+            in_rpath = false;
+        } else if trimmed.contains(".dylib") && !trimmed.ends_with(':') {
+            lines.push(trimmed.split(" (compatibility").next().unwrap().to_string());
+        }
+    }
+    lines.join("\n")
+}
+
+fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut i = 0;
+    while i < haystack.len() {
+        if haystack[i..].starts_with(needle) {
+            out.extend_from_slice(replacement);
+            i += needle.len();
+        } else {
+            out.push(haystack[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn single_version_dir(rack: &Path) -> PathBuf {
+    let versions: Vec<_> = fs::read_dir(rack)
+        .unwrap_or_else(|e| panic!("no rack at {}: {e}", rack.display()))
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .collect();
+    assert_eq!(
+        versions.len(),
+        1,
+        "expected exactly one version in {}",
+        rack.display()
+    );
+    versions[0].path()
+}
+
+fn stdout(output: &Output, context: &str) -> String {
+    assert_success(output, context);
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn assert_success(output: &Output, context: &str) {
+    assert!(
+        output.status.success(),
+        "{context} failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Every difference between two snapshots, as human-readable lines.
+fn differences(
+    reference: &BTreeMap<String, Entry>,
+    actual: &BTreeMap<String, Entry>,
+    allowlist: &[(&str, &str)],
+) -> Vec<String> {
+    let allowed = |rel: &str| allowlist.iter().find(|(name, _)| *name == rel);
+    let mut diffs = Vec::new();
+    for (rel, expected) in reference {
+        if allowed(rel).is_some() {
+            continue;
+        }
+        match actual.get(rel) {
+            None => diffs.push(format!("missing: {rel}")),
+            Some(found) if found != expected => {
+                diffs.push(format!(
+                    "differs: {rel}\n  homebrew: {expected:.200?}\n  zerobrew: {found:.200?}"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for rel in actual.keys() {
+        if !reference.contains_key(rel) && allowed(rel).is_none() {
+            diffs.push(format!("extra: {rel}"));
+        }
+    }
+    diffs
+}
+
+fn assert_no_differences(what: &str, diffs: &[String]) {
+    assert!(
+        diffs.is_empty(),
+        "{what}: {} difference(s) from Homebrew:\n{}",
+        diffs.len(),
+        diffs.join("\n")
+    );
+}
+
+/// `xz`: a `cellar :any` bottle with dylibs that need relocation and binaries
+/// that need re-signing, and no dependencies.
+#[test]
+fn xz_keg_matches_homebrew() {
+    let Some(brew) = Brew::find() else { return };
+    let zb = Zb::new();
+
+    let reference_keg = brew.install("xz");
+    let keg = zb.install("xz");
+    assert_eq!(
+        reference_keg.file_name(),
+        keg.file_name(),
+        "both installs should pick the same version"
+    );
+
+    let diffs = differences(
+        &snapshot(&reference_keg, &brew.prefix),
+        &snapshot(&keg, &zb.prefix()),
+        KEG_ALLOWLIST,
+    );
+    assert_no_differences("xz keg", &diffs);
+
+    // Relocated and re-signed binaries must still be valid and runnable.
+    for binary in ["bin/xz", "lib/liblzma.5.dylib"] {
+        let status = Command::new("codesign")
+            .args(["--verify", "--strict"])
+            .arg(keg.join(binary))
+            .status()
+            .expect("failed to run codesign");
+        assert!(status.success(), "codesign rejects {binary}");
+    }
+    let output = Command::new(keg.join("bin/xz"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert_success(&output, "xz --version");
+    let version = keg.file_name().unwrap().to_string_lossy();
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&*version),
+        "xz --version should report {version}"
+    );
+}
+
+/// The symlinks Homebrew creates in the prefix for a keg, keyed by their path
+/// relative to the prefix, with targets relative to the prefix too.
+fn links_into(prefix: &Path, keg: &Path) -> BTreeMap<String, String> {
+    let mut links = BTreeMap::new();
+    for dir in ["bin", "sbin", "lib", "include", "share", "etc", "opt"] {
+        let root = prefix.join(dir);
+        if !root.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+            let entry = entry.expect("failed to walk prefix");
+            if !entry.path_is_symlink() {
+                continue;
+            }
+            let Ok(target) = fs::canonicalize(entry.path()) else {
+                continue;
+            };
+            if !target.starts_with(keg) {
+                continue;
+            }
+            let rel = entry.path().strip_prefix(prefix).unwrap();
+            let target_rel = target.strip_prefix(keg).unwrap();
+            links.insert(
+                rel.to_string_lossy().into_owned(),
+                format!("<keg>/{}", target_rel.to_string_lossy()),
+            );
+        }
+    }
+    links
+}
+
+/// Known gap: zerobrew links the files inside `include/lzma` one by one where
+/// Homebrew links the directory itself.
+/// Tracked in https://github.com/zerobrewhq/zerobrew/issues/423.
+#[test]
+#[ignore = "known difference: include directories are linked per file, see https://github.com/zerobrewhq/zerobrew/issues/423"]
+fn xz_links_match_homebrew() {
+    let Some(brew) = Brew::find() else { return };
+    let zb = Zb::new();
+
+    let reference_keg = brew.install("xz");
+    let keg = zb.install("xz");
+
+    let reference = links_into(&brew.prefix, &fs::canonicalize(&reference_keg).unwrap());
+    let actual = links_into(&zb.prefix(), &fs::canonicalize(&keg).unwrap());
+    let mut diffs = Vec::new();
+    for (rel, target) in &reference {
+        match actual.get(rel) {
+            None => diffs.push(format!("missing link: {rel} -> {target}")),
+            Some(found) if found != target => diffs.push(format!(
+                "link differs: {rel}\n  homebrew: {target}\n  zerobrew: {found}"
+            )),
+            Some(_) => {}
+        }
+    }
+    for rel in actual.keys() {
+        if !reference.contains_key(rel) {
+            diffs.push(format!("extra link: {rel}"));
+        }
+    }
+    assert_no_differences("xz links", &diffs);
+}

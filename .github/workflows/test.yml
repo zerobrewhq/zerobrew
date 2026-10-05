@@ -61,3 +61,12 @@ jobs:
 
       - name: run integration tests
         run: cargo test --package zb_cli --test integration -- --ignored
+
+      # Compares what zb installs against what the runner's Homebrew installs.
+      # macOS runners ship Homebrew; REQUIRE_BREW turns a missing one into a
+      # failure instead of a silent skip.
+      - name: run parity tests
+        if: runner.os == 'macOS'
+        env:
+          ZB_PARITY_REQUIRE_BREW: "1"
+        run: cargo test --package zb_cli --test parity
