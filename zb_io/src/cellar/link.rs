@@ -693,10 +693,14 @@ impl Linker {
     /// Remove every `opt/` entry that points at this keg: its own name and
     /// any alias or old name it was linked under.
     fn unlink_opt(&self, keg_path: &Path) -> Result<(), Error> {
+        // A keg that no longer exists has no links to find; dangling links
+        // would all "match" an unresolvable path.
+        let Ok(keg) = fs::canonicalize(keg_path) else {
+            return Ok(());
+        };
         let Ok(entries) = fs::read_dir(&self.opt_dir) else {
             return Ok(());
         };
-        let keg = fs::canonicalize(keg_path).ok();
         for entry in entries.flatten() {
             let opt_link = entry.path();
             if let Ok(target) = fs::read_link(&opt_link) {
@@ -705,7 +709,7 @@ impl Linker {
                 } else {
                     target
                 };
-                if fs::canonicalize(&resolved).ok() == keg {
+                if fs::canonicalize(&resolved).is_ok_and(|p| p == keg) {
                     let _ = fs::remove_file(&opt_link);
                 }
             }
@@ -733,6 +737,17 @@ impl Linker {
     }
 
     fn link_opt_name(&self, keg_path: &Path, name: &str) -> Result<(), Error> {
+        // Names come from formula JSON; only a plain file name may be joined
+        // under opt/, never a path.
+        let mut components = Path::new(name).components();
+        if !matches!(
+            (components.next(), components.next()),
+            (Some(Component::Normal(_)), None)
+        ) {
+            return Err(Error::StoreCorruption {
+                message: format!("invalid opt link name: {name:?}"),
+            });
+        }
         let opt_link = self.opt_dir.join(name);
         if opt_link.symlink_metadata().is_ok() {
             if let Ok(target) = fs::read_link(&opt_link) {
@@ -931,6 +946,29 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn opt_rejects_alias_names_that_are_paths() {
+        let tmp = TempDir::new().unwrap();
+        let keg = setup_keg(&tmp, "foo");
+        let linker = Linker::new(tmp.path()).unwrap();
+        for bad in ["../bin/tool", "/etc/passwd", "a/b", ".."] {
+            assert!(linker.link_opt(&keg, &[bad.to_string()]).is_err(), "{bad}");
+        }
+        assert!(tmp.path().join("bin/tool").symlink_metadata().is_err());
+    }
+
+    #[test]
+    fn unlink_opt_leaves_other_dangling_links_alone() {
+        let tmp = TempDir::new().unwrap();
+        let linker = Linker::new(tmp.path()).unwrap();
+        let dangling = tmp.path().join("opt/gone");
+        std::os::unix::fs::symlink(tmp.path().join("cellar/gone/1.0"), &dangling).unwrap();
+
+        let missing_keg = tmp.path().join("cellar/other/1.0");
+        linker.unlink_keg(&missing_keg).unwrap();
+        assert!(dangling.symlink_metadata().is_ok());
     }
 
     #[test]
