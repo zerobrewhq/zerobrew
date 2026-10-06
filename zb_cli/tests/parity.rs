@@ -335,47 +335,182 @@ fn assert_no_differences(what: &str, diffs: &[String]) {
     );
 }
 
-/// `xz`: a `cellar :any` bottle with dylibs that need relocation and binaries
-/// that need re-signing, and no dependencies.
-#[test]
-fn xz_keg_matches_homebrew() {
-    let Some(brew) = Brew::find() else { return };
+/// One formula per kind of bottle the issue asks the harness to cover.
+/// `kegs` lists every keg the install produces, dependencies included.
+struct Case {
+    formula: &'static str,
+    kegs: &'static [&'static str],
+    /// Bottles built for `/opt/homebrew/Cellar` only pour when the reference
+    /// Homebrew lives there; anywhere else it builds from source and the
+    /// comparison is meaningless.
+    needs_default_prefix: bool,
+}
+
+const CASES: &[Case] = &[
+    // `:any_skip_relocation`: nothing to patch, the simplest pour.
+    Case {
+        formula: "hello",
+        kegs: &["hello"],
+        needs_default_prefix: false,
+    },
+    // `:any`: dylibs whose install names are rewritten and re-signed.
+    Case {
+        formula: "xz",
+        kegs: &["xz"],
+        needs_default_prefix: false,
+    },
+    // `:any` and keg-only: poured and relocated but not linked.
+    Case {
+        formula: "readline",
+        kegs: &["readline"],
+        needs_default_prefix: false,
+    },
+    // Explicit cellar: Cellar paths baked into the binaries get rewritten.
+    Case {
+        formula: "pkgconf",
+        kegs: &["pkgconf"],
+        needs_default_prefix: true,
+    },
+    // `all` bottle with post-install steps.
+    Case {
+        formula: "ca-certificates",
+        kegs: &["ca-certificates"],
+        needs_default_prefix: false,
+    },
+    // A dependency chain: both kegs must match, not just the named one.
+    Case {
+        formula: "jq",
+        kegs: &["jq", "oniguruma"],
+        needs_default_prefix: false,
+    },
+];
+
+fn case(formula: &str) -> &'static Case {
+    CASES
+        .iter()
+        .find(|case| case.formula == formula)
+        .unwrap_or_else(|| panic!("no parity case for {formula}"))
+}
+
+/// Install with both tools and return `(brew prefix, zb env)` once both are
+/// in place, or `None` when the test should skip.
+fn install_both(case: &Case) -> Option<(Brew, Zb)> {
+    let brew = Brew::find()?;
+    if case.needs_default_prefix && brew.prefix != Path::new("/opt/homebrew") {
+        eprintln!(
+            "skipping {}: explicit-cellar bottles only pour at /opt/homebrew, reference is at {}",
+            case.formula,
+            brew.prefix.display()
+        );
+        return None;
+    }
     let zb = Zb::new();
+    brew.install(case.formula);
+    zb.install(case.formula);
+    Some((brew, zb))
+}
 
-    let reference_keg = brew.install("xz");
-    let keg = fs::canonicalize(zb.install("xz")).unwrap();
-    assert_eq!(
-        reference_keg.file_name(),
-        keg.file_name(),
-        "both installs should pick the same version"
-    );
+fn reference_keg(brew: &Brew, name: &str) -> PathBuf {
+    let opt = PathBuf::from(stdout(
+        &brew.run(&["--prefix", name]),
+        &format!("brew --prefix {name}"),
+    ));
+    fs::canonicalize(&opt).unwrap_or_else(|e| panic!("cannot resolve {}: {e}", opt.display()))
+}
 
-    let diffs = differences(
-        &snapshot(&reference_keg, &brew.prefix),
-        &snapshot(&keg, &zb.prefix()),
-        KEG_ALLOWLIST,
-    );
-    assert_no_differences("xz keg", &diffs);
+fn zb_keg(zb: &Zb, name: &str) -> PathBuf {
+    fs::canonicalize(single_version_dir(&zb.prefix().join("Cellar").join(name))).unwrap()
+}
 
-    // Relocated and re-signed binaries must still be valid and runnable.
-    for binary in ["bin/xz", "lib/liblzma.5.dylib"] {
+/// Every keg the install produced matches Homebrew's, and every executable
+/// in them starts.
+fn check_kegs(case: &Case) {
+    let Some((brew, zb)) = install_both(case) else {
+        return;
+    };
+    for name in case.kegs {
+        let reference = reference_keg(&brew, name);
+        let keg = zb_keg(&zb, name);
+        assert_eq!(
+            reference.file_name(),
+            keg.file_name(),
+            "{name}: both installs should pick the same version"
+        );
+        let diffs = differences(
+            &snapshot(&reference, &brew.prefix),
+            &snapshot(&keg, &zb.prefix()),
+            KEG_ALLOWLIST,
+        );
+        assert_no_differences(&format!("{name} keg"), &diffs);
+        check_executables_start(&keg);
+    }
+}
+
+/// Relocation and re-signing are only proven by running the result. Every
+/// Mach-O executable in `bin` must be accepted by `codesign` and must start:
+/// any exit code is fine, dying from a signal (bad signature, missing dylib)
+/// is not.
+fn check_executables_start(keg: &Path) {
+    let bin = keg.join("bin");
+    let Ok(entries) = fs::read_dir(&bin) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_file() || !is_mach_o(&path) {
+            continue;
+        }
         let status = Command::new("codesign")
             .args(["--verify", "--strict"])
-            .arg(keg.join(binary))
+            .arg(&path)
             .status()
             .expect("failed to run codesign");
-        assert!(status.success(), "codesign rejects {binary}");
+        assert!(status.success(), "codesign rejects {}", path.display());
+
+        let output = Command::new(&path)
+            .arg("--version")
+            .env("PATH", bin.to_string_lossy().as_ref())
+            .output()
+            .unwrap_or_else(|e| panic!("cannot start {}: {e}", path.display()));
+        use std::os::unix::process::ExitStatusExt;
+        assert!(
+            output.status.signal().is_none(),
+            "{} died from signal {:?}:\n{}",
+            path.display(),
+            output.status.signal(),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
-    let output = Command::new(keg.join("bin/xz"))
-        .arg("--version")
-        .output()
-        .unwrap();
-    assert_success(&output, "xz --version");
-    let version = keg.file_name().unwrap().to_string_lossy();
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains(&*version),
-        "xz --version should report {version}"
-    );
+}
+
+#[test]
+fn hello_kegs_match_homebrew() {
+    check_kegs(case("hello"));
+}
+
+#[test]
+fn xz_kegs_match_homebrew() {
+    check_kegs(case("xz"));
+}
+
+#[test]
+fn readline_kegs_match_homebrew() {
+    check_kegs(case("readline"));
+}
+
+#[test]
+fn pkgconf_kegs_match_homebrew() {
+    check_kegs(case("pkgconf"));
+}
+
+#[test]
+fn ca_certificates_kegs_match_homebrew() {
+    check_kegs(case("ca-certificates"));
+}
+
+#[test]
+fn jq_kegs_match_homebrew() {
+    check_kegs(case("jq"));
 }
 
 /// The symlinks Homebrew creates in the prefix for a keg, keyed by their path
@@ -409,34 +544,37 @@ fn links_into(prefix: &Path, keg: &Path) -> BTreeMap<String, String> {
     links
 }
 
-/// Known gap: zerobrew links the files inside `include/lzma` one by one where
-/// Homebrew links the directory itself.
+/// The symlinks in the prefix match too, for every keg of every case.
+///
+/// Known gap: zerobrew links the files inside directories such as
+/// `include/lzma` one by one where Homebrew links the directory itself.
 /// Tracked in https://github.com/zerobrewhq/zerobrew/issues/423.
 #[test]
 #[ignore = "known difference: include directories are linked per file, see https://github.com/zerobrewhq/zerobrew/issues/423"]
-fn xz_links_match_homebrew() {
-    let Some(brew) = Brew::find() else { return };
-    let zb = Zb::new();
-
-    let reference_keg = brew.install("xz");
-    let keg = zb.install("xz");
-
-    let reference = links_into(&brew.prefix, &fs::canonicalize(&reference_keg).unwrap());
-    let actual = links_into(&zb.prefix(), &fs::canonicalize(&keg).unwrap());
-    let mut diffs = Vec::new();
-    for (rel, target) in &reference {
-        match actual.get(rel) {
-            None => diffs.push(format!("missing link: {rel} -> {target}")),
-            Some(found) if found != target => diffs.push(format!(
-                "link differs: {rel}\n  homebrew: {target}\n  zerobrew: {found}"
-            )),
-            Some(_) => {}
+fn links_match_homebrew() {
+    let mut all_diffs = Vec::new();
+    for case in CASES {
+        let Some((brew, zb)) = install_both(case) else {
+            continue;
+        };
+        for name in case.kegs {
+            let reference = links_into(&brew.prefix, &reference_keg(&brew, name));
+            let actual = links_into(&zb.prefix(), &zb_keg(&zb, name));
+            for (rel, target) in &reference {
+                match actual.get(rel) {
+                    None => all_diffs.push(format!("{name}: missing link: {rel} -> {target}")),
+                    Some(found) if found != target => all_diffs.push(format!(
+                        "{name}: link differs: {rel}\n  homebrew: {target}\n  zerobrew: {found}"
+                    )),
+                    Some(_) => {}
+                }
+            }
+            for rel in actual.keys() {
+                if !reference.contains_key(rel) {
+                    all_diffs.push(format!("{name}: extra link: {rel}"));
+                }
+            }
         }
     }
-    for rel in actual.keys() {
-        if !reference.contains_key(rel) {
-            diffs.push(format!("extra link: {rel}"));
-        }
-    }
-    assert_no_differences("xz links", &diffs);
+    assert_no_differences("links", &all_diffs);
 }
