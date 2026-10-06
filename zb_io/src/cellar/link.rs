@@ -95,16 +95,14 @@ fn is_locale_dir(rel: &str) -> bool {
         .any(|pair| (pair[0] == "locale" || pair[0] == "man") && is_locale_name(pair[1]))
 }
 
-/// `de`, `pt_BR`, `en_US.UTF-8`, `sr@latin`, `C`, `POSIX`.
+/// Homebrew's pattern is `(?:[a-z]{2}|C|POSIX)(?:_[A-Z]{2})?...` with no end
+/// anchor, so only the start of the name decides: two lowercase letters, `C`
+/// or `POSIX`. `sr@latin`, `en_US.UTF-8` and `english` all qualify.
 fn is_locale_name(name: &str) -> bool {
-    let name = name.split(['.', '@']).next().unwrap_or(name);
-    let (lang, territory) = name.split_once('_').unwrap_or((name, ""));
-    let plain_lang = lang == "C"
-        || lang == "POSIX"
-        || (lang.len() == 2 && lang.bytes().all(|b| b.is_ascii_lowercase()));
-    let plain_territory = territory.is_empty()
-        || (territory.len() == 2 && territory.bytes().all(|b| b.is_ascii_uppercase()));
-    plain_lang && plain_territory
+    let bytes = name.as_bytes();
+    name.starts_with('C')
+        || name.starts_with("POSIX")
+        || (bytes.len() >= 2 && bytes[..2].iter().all(u8::is_ascii_lowercase))
 }
 
 /// How Homebrew links the directory at `rel` inside the keg's `top` directory.
@@ -1010,7 +1008,10 @@ mod tests {
         assert!(is_locale_dir("locale/C"));
         assert!(is_locale_dir("locale/de/LC_MESSAGES"));
         assert!(is_locale_dir("gettext/locale/de"));
+        // Homebrew's pattern has no end anchor, so these count too.
+        assert!(is_locale_dir("locale/english"));
         assert!(!is_locale_dir("locale/German"));
+        assert!(!is_locale_dir("locale/d"));
         assert!(!is_locale_dir("doc/de"));
         assert!(!is_locale_dir("locale"));
     }
