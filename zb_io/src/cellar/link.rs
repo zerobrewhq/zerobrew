@@ -923,7 +923,13 @@ mod tests {
 
         linker.unlink_keg(&keg).unwrap();
         for name in ["pkgconf", "pkg-config", "pkgconfig"] {
-            assert!(tmp.path().join("opt").join(name).symlink_metadata().is_err());
+            assert!(
+                tmp.path()
+                    .join("opt")
+                    .join(name)
+                    .symlink_metadata()
+                    .is_err()
+            );
         }
     }
 
