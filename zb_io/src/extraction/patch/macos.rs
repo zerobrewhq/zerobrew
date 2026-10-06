@@ -74,15 +74,16 @@ fn patch_text_file_strings(
     Ok(())
 }
 
-/// Patch hardcoded Homebrew paths in Mach-O binary data sections.
-/// This handles paths like /opt/homebrew/opt/git/libexec/git-core that are baked into binaries.
+/// Patch hardcoded Homebrew paths in a binary file's strings, in place.
+/// This handles paths like /opt/homebrew/opt/git/libexec/git-core that are
+/// baked into Mach-O binaries and static archives.
 /// Only `build_prefix`, the prefix the bottle was built in, is rewritten: other
 /// paths like /usr/local on Apple Silicon aren't Homebrew's and must be left alone.
-fn patch_macho_binary_strings(
-    path: &Path,
-    build_prefix: &str,
-    new_prefix: &str,
-) -> Result<(), Error> {
+///
+/// A shorter prefix is padded with `/` to the old length, as Homebrew does, so
+/// the rest of the path is still reachable: `/opt/homebrew/Cellar/x` becomes
+/// `/tmp/zb/////Cellar/x`, not a string that ends at the prefix.
+fn patch_binary_strings(path: &Path, build_prefix: &str, new_prefix: &str) -> Result<(), Error> {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
 
@@ -128,11 +129,11 @@ fn patch_macho_binary_strings(
         if contents[i..i + old_bytes.len()] == *old_bytes
             && matches!(
                 contents.get(i + old_bytes.len()).copied(),
-                None | Some(0) | Some(b'/')
+                None | Some(0) | Some(b'/') | Some(b':')
             )
         {
             contents[i..i + new_bytes.len()].copy_from_slice(new_bytes);
-            contents[i + new_bytes.len()..i + old_bytes.len()].fill(0);
+            contents[i + new_bytes.len()..i + old_bytes.len()].fill(b'/');
             patched = true;
             i += old_bytes.len();
         } else {
@@ -167,7 +168,10 @@ fn patch_macho_binary_strings(
     fs::set_permissions(path, perms)
         .map_err(Error::store("failed to restore permissions after patching"))?;
 
-    if let Err(e) = resign(path) {
+    // Only Mach-O files carry a signature; a static archive has nothing to re-sign.
+    if is_macho(path)
+        && let Err(e) = resign(path)
+    {
         warn!(
             path = %path.display(),
             error = %e,
@@ -208,25 +212,34 @@ pub fn patch_homebrew_placeholders(
     let version_pattern = format!(r"(/Cellar/{}/)([^/]+)(/)", regex::escape(pkg_name));
     let version_regex = Regex::new(&version_pattern).ok();
 
-    // Collect all Mach-O files first (skip symlinks to avoid double-processing)
-    let macho_files: Vec<PathBuf> = walkdir::WalkDir::new(keg_path)
+    // Collect all regular files first (skip symlinks to avoid double-processing)
+    let files: Vec<PathBuf> = walkdir::WalkDir::new(keg_path)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            // Skip symlinks - only process actual files
-            e.file_type().is_file()
-        })
-        .filter(|e| is_macho(e.path()))
+        .filter(|e| e.file_type().is_file())
         .map(|e| e.path().to_path_buf())
+        .collect();
+
+    // Binary files need their strings rewritten in place. That is every file
+    // with a NUL byte, not just Mach-O: static archives embed the build
+    // prefix too (pkgconf's libpkgconf.a carries its personality.d path).
+    let binary_files: Vec<&PathBuf> = files
+        .iter()
+        .filter(|path| text::is_binary(path).unwrap_or(false))
+        .collect();
+    let macho_files: Vec<&PathBuf> = binary_files
+        .iter()
+        .copied()
+        .filter(|path| is_macho(path))
         .collect();
 
     let patch_failures = AtomicUsize::new(0);
     let first_patch_error: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
 
-    // First pass: patch binary strings in Mach-O files
-    macho_files.par_iter().for_each(|path| {
-        if let Err(e) = patch_macho_binary_strings(path, build_prefix, &prefix_str) {
+    // First pass: patch strings in binary files
+    binary_files.par_iter().for_each(|path| {
+        if let Err(e) = patch_binary_strings(path, build_prefix, &prefix_str) {
             patch_failures.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut guard) = first_patch_error.lock()
                 && guard.is_none()
@@ -242,16 +255,8 @@ pub fn patch_homebrew_placeholders(
         return Err(e);
     }
 
-    // Second pass: patch text files
-    let text_files: Vec<PathBuf> = walkdir::WalkDir::new(keg_path)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.path().to_path_buf())
-        .collect();
-
-    text_files.par_iter().for_each(|path| {
+    // Second pass: patch text files (the patcher skips binaries itself)
+    files.par_iter().for_each(|path| {
         if let Err(e) = patch_text_file_strings(path, build_prefix, &prefix_str, &cellar_str) {
             warn!(path = %path.display(), error = %e, "failed to patch text file");
         }
@@ -502,7 +507,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_patch_macho_preserves_execute_bit() {
+    fn test_patch_binary_preserves_execute_bit() {
         let tmp = TempDir::new().unwrap();
         let test_file = tmp.path().join("test_binary");
 
@@ -521,7 +526,7 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&test_file, perms).unwrap();
 
-        patch_macho_binary_strings(&test_file, old_prefix, new_prefix).unwrap();
+        patch_binary_strings(&test_file, old_prefix, new_prefix).unwrap();
 
         let mode = fs::metadata(&test_file).unwrap().permissions().mode();
         assert!(
@@ -532,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_macho_binary_strings() {
+    fn test_patch_binary_strings() {
         let tmp = TempDir::new().unwrap();
         let test_file = tmp.path().join("test_binary");
 
@@ -551,7 +556,7 @@ mod tests {
 
         fs::write(&test_file, &contents).unwrap();
 
-        let result = patch_macho_binary_strings(&test_file, old_prefix, new_prefix);
+        let result = patch_binary_strings(&test_file, old_prefix, new_prefix);
         assert!(result.is_ok());
 
         let patched = fs::read(&test_file).unwrap();
@@ -562,7 +567,57 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_macho_skips_when_new_prefix_longer() {
+    fn test_patch_binary_pads_a_shorter_prefix_with_slashes() {
+        let tmp = TempDir::new().unwrap();
+        let test_file = tmp.path().join("test_binary");
+
+        let mut contents = Vec::new();
+        contents.extend_from_slice(b"\xfe\xed\xfa\xcf");
+        contents.extend_from_slice(b"/opt/homebrew/Cellar/pkgconf/3.0.7/share\0");
+        contents.extend_from_slice(b"/opt/homebrew/lib:/opt/homebrew/share\0");
+        contents.extend_from_slice(b"/opt/homebrew\0");
+        let original_len = contents.len();
+        fs::write(&test_file, &contents).unwrap();
+
+        patch_binary_strings(&test_file, "/opt/homebrew", "/tmp/zb").unwrap();
+
+        let patched = fs::read(&test_file).unwrap();
+        assert_eq!(
+            patched.len(),
+            original_len,
+            "rewrite must keep the file size"
+        );
+        let patched = String::from_utf8_lossy(&patched);
+        // The tail of each path must still be reachable: NUL padding would end
+        // the C string at the prefix.
+        assert!(patched.contains("/tmp/zb///////Cellar/pkgconf/3.0.7/share\0"));
+        assert!(patched.contains("/tmp/zb///////lib:/tmp/zb///////share\0"));
+        assert!(patched.contains("/tmp/zb//////\0"));
+        assert!(!patched.contains("/opt/homebrew"));
+    }
+
+    #[test]
+    fn test_patch_binary_rewrites_static_archives() {
+        let tmp = TempDir::new().unwrap();
+        let test_file = tmp.path().join("libfoo.a");
+
+        // An `ar` archive is binary but not Mach-O; Homebrew rewrites it too.
+        let mut contents = Vec::new();
+        contents.extend_from_slice(b"!<arch>\n");
+        contents.extend_from_slice(b"foo.o/          0  0  0  644  64  `\n");
+        contents.extend_from_slice(b"\xcf\xfa\xed\xfe\0\0\0\0");
+        contents.extend_from_slice(b"/opt/homebrew/share/pkgconfig/personality.d\0");
+        fs::write(&test_file, &contents).unwrap();
+
+        patch_binary_strings(&test_file, "/opt/homebrew", "/opt/zerobrew").unwrap();
+
+        let patched = String::from_utf8_lossy(&fs::read(&test_file).unwrap()).into_owned();
+        assert!(patched.contains("/opt/zerobrew/share/pkgconfig/personality.d"));
+        assert!(!patched.contains("/opt/homebrew"));
+    }
+
+    #[test]
+    fn test_patch_binary_skips_when_new_prefix_longer() {
         let tmp = TempDir::new().unwrap();
         let test_file = tmp.path().join("test_binary");
 
@@ -582,7 +637,7 @@ mod tests {
         // Should succeed (skip) rather than error when the new prefix is
         // longer than the old one — install_name_tool handles load command
         // changes regardless of length.
-        let result = patch_macho_binary_strings(&test_file, old_prefix, new_prefix);
+        let result = patch_binary_strings(&test_file, old_prefix, new_prefix);
         assert!(
             result.is_ok(),
             "should skip when new prefix is longer than old prefix"
@@ -669,7 +724,7 @@ echo "Hello from $PREFIX"
     }
 
     #[test]
-    fn test_patch_macho_only_rewrites_the_build_prefix() {
+    fn test_patch_binary_only_rewrites_the_build_prefix() {
         let tmp = TempDir::new().unwrap();
         let test_file = tmp.path().join("test_binary");
 
@@ -679,7 +734,7 @@ echo "Hello from $PREFIX"
         contents.extend_from_slice(b"/usr/local/lib/node_modules\0");
         fs::write(&test_file, &contents).unwrap();
 
-        patch_macho_binary_strings(&test_file, "/opt/homebrew", "/opt/zerobrew").unwrap();
+        patch_binary_strings(&test_file, "/opt/homebrew", "/opt/zerobrew").unwrap();
 
         let patched = String::from_utf8_lossy(&fs::read(&test_file).unwrap()).into_owned();
         assert!(patched.contains("/opt/zerobrew/etc/gitconfig"));

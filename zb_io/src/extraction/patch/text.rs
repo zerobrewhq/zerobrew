@@ -15,9 +15,7 @@ use super::phar;
 /// and left alone. PHP archives get their signature recomputed after
 /// patching. Returns whether the file changed.
 pub(crate) fn rewrite_text_file(path: &Path, replacements: &[(&str, &str)]) -> io::Result<bool> {
-    let mut head = [0u8; 8192];
-    let n = fs::File::open(path)?.read(&mut head)?;
-    if head[..n].contains(&0) && !head[..n].starts_with(b"#!") {
+    if is_binary(path)? {
         return Ok(false);
     }
 
@@ -41,6 +39,15 @@ pub(crate) fn rewrite_text_file(path: &Path, replacements: &[(&str, &str)]) -> i
 
     write_preserving_mode(path, &content)?;
     Ok(true)
+}
+
+/// Whether `path` is a binary file: it has a NUL byte in its first 8 KiB and
+/// is not a `#!` script. This is the split Homebrew uses between files it
+/// rewrites freely and files whose strings must be replaced in place.
+pub(crate) fn is_binary(path: &Path) -> io::Result<bool> {
+    let mut head = [0u8; 8192];
+    let n = fs::File::open(path)?.read(&mut head)?;
+    Ok(head[..n].contains(&0) && !head[..n].starts_with(b"#!"))
 }
 
 fn replace_all(haystack: &[u8], from: &[u8], to: &[u8]) -> Option<Vec<u8>> {

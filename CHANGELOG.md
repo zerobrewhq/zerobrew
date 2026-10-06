@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Homebrew tap moved to `zerobrewhq/zerobrew`. Installs from `cachebag/zerobrew` keep updating, since that tap was transferred rather than replaced
 - `zb install` no longer upgrades dependencies that are already installed. Installing a package only installs the dependencies that are missing, and `zb upgrade <pkg>` only upgrades the package you name. Use `zb upgrade` to bring everything up to date
 
+### Fixed
+- When a bottle pinned to `/opt/homebrew` is installed under a custom prefix, rewrite the hardcoded paths in every binary file, not only Mach-O ones, so static libraries like `pkgconf`'s `libpkgconf.a` no longer point at `/opt/homebrew`. A shorter prefix is now padded with `/` instead of NUL, which cut such paths off at the prefix. Found by the parity harness ([#421](https://github.com/zerobrewhq/zerobrew/issues/421))
+
 ## [0.3.5] - 2026-09-30
 
 ### Fixed

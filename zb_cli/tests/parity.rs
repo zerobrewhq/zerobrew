@@ -196,7 +196,7 @@ fn snapshot(root: &Path, prefix: &Path) -> BTreeMap<String, Entry> {
             let content = fs::read(entry.path()).expect("failed to read file");
             Entry::File {
                 mode,
-                content: replace_bytes(&content, prefix_str.as_bytes(), marker.as_bytes()),
+                content: normalize_prefix(&content, prefix_str, marker),
             }
         };
         entries.insert(rel, value);
@@ -250,6 +250,21 @@ fn mach_o_load_commands(path: &Path) -> String {
         }
     }
     lines.join("\n")
+}
+
+/// Replace `prefix` with `marker`, including the form zerobrew writes into
+/// binaries: a prefix shorter than the one the bottle was built in is padded
+/// with `/` to the same length, so `/opt/homebrew/Cellar` becomes
+/// `/tmp/zbabc////Cellar`. Homebrew pads the same way when it relocates a
+/// build prefix.
+fn normalize_prefix(content: &[u8], prefix: &str, marker: &str) -> Vec<u8> {
+    let build_prefix_len = "/opt/homebrew".len();
+    let mut out = content.to_vec();
+    if prefix.len() < build_prefix_len {
+        let padded = format!("{prefix}{}", "/".repeat(build_prefix_len - prefix.len()));
+        out = replace_bytes(&out, padded.as_bytes(), marker.as_bytes());
+    }
+    replace_bytes(&out, prefix.as_bytes(), marker.as_bytes())
 }
 
 fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
@@ -312,7 +327,9 @@ fn differences(
             None => diffs.push(format!("missing: {rel}")),
             Some(found) if found != expected => {
                 diffs.push(format!(
-                    "differs: {rel}\n  homebrew: {expected:.200?}\n  zerobrew: {found:.200?}"
+                    "differs: {rel}\n  homebrew: {}\n  zerobrew: {}",
+                    brief(expected),
+                    brief(found)
                 ));
             }
             Some(_) => {}
@@ -324,6 +341,16 @@ fn differences(
         }
     }
     diffs
+}
+
+/// A `Debug` rendering cut to a readable length: a whole static archive in a
+/// failure message helps nobody.
+fn brief(entry: &Entry) -> String {
+    let text = format!("{entry:?}");
+    match text.char_indices().nth(200) {
+        Some((i, _)) => format!("{}… ({} chars)", &text[..i], text.len()),
+        None => text,
+    }
 }
 
 fn assert_no_differences(what: &str, diffs: &[String]) {
