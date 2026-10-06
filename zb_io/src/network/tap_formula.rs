@@ -389,6 +389,8 @@ pub fn parse_tap_formula_ruby(spec: &TapFormulaRef, source: &str) -> Result<Form
         uses_from_macos: Vec::new(),
         requirements: Vec::new(),
         variations: None,
+        aliases: Vec::new(),
+        oldnames: Vec::new(),
     })
 }
 

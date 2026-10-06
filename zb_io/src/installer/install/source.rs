@@ -97,7 +97,14 @@ impl Installer {
             return Err(e);
         }
 
-        if let Err(e) = self.linker.link_opt(&keg_path) {
+        let opt_names: Vec<String> = item
+            .formula
+            .aliases
+            .iter()
+            .chain(&item.formula.oldnames)
+            .cloned()
+            .collect();
+        if let Err(e) = self.linker.link_opt(&keg_path, &opt_names) {
             warn!(formula = %install_name, error = %e, "failed to create opt link");
         }
 

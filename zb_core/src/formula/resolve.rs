@@ -139,6 +139,8 @@ mod tests {
             uses_from_macos: Vec::new(),
             requirements: Vec::new(),
             variations: None,
+            aliases: Vec::new(),
+            oldnames: Vec::new(),
         }
     }
 

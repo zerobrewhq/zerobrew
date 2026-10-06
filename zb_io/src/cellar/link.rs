@@ -428,7 +428,7 @@ impl Linker {
 
     pub fn link_keg(&self, keg_path: &Path) -> Result<Vec<LinkedFile>, Error> {
         self.check_conflicts(keg_path)?;
-        self.link_opt(keg_path)?;
+        self.link_opt(keg_path, &[])?;
         let mut linked = Vec::new();
         for dir_name in LINK_DIRS {
             let src_dir = keg_path.join(dir_name);
@@ -690,20 +690,22 @@ impl Linker {
         Ok(linked)
     }
 
+    /// Remove every `opt/` entry that points at this keg: its own name and
+    /// any alias or old name it was linked under.
     fn unlink_opt(&self, keg_path: &Path) -> Result<(), Error> {
-        let name = keg_path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str());
-        if let Some(name) = name {
-            let opt_link = self.opt_dir.join(name);
+        let Ok(entries) = fs::read_dir(&self.opt_dir) else {
+            return Ok(());
+        };
+        let keg = fs::canonicalize(keg_path).ok();
+        for entry in entries.flatten() {
+            let opt_link = entry.path();
             if let Ok(target) = fs::read_link(&opt_link) {
                 let resolved = if target.is_relative() {
                     opt_link.parent().unwrap_or(Path::new("")).join(&target)
                 } else {
                     target
                 };
-                if fs::canonicalize(&resolved).ok() == fs::canonicalize(keg_path).ok() {
+                if fs::canonicalize(&resolved).ok() == keg {
                     let _ = fs::remove_file(&opt_link);
                 }
             }
@@ -711,7 +713,9 @@ impl Linker {
         Ok(())
     }
 
-    pub fn link_opt(&self, keg_path: &Path) -> Result<(), Error> {
+    /// Link the keg under `opt/<name>` and, as Homebrew does, under each of
+    /// its aliases and old names, so `opt/pkg-config` reaches `pkgconf`.
+    pub fn link_opt(&self, keg_path: &Path, aliases: &[String]) -> Result<(), Error> {
         let name = keg_path
             .parent()
             .and_then(|p| p.file_name())
@@ -719,6 +723,16 @@ impl Linker {
             .ok_or_else(|| Error::StoreCorruption {
                 message: "invalid keg path".into(),
             })?;
+        self.link_opt_name(keg_path, name)?;
+        for alias in aliases {
+            if alias != name {
+                self.link_opt_name(keg_path, alias)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn link_opt_name(&self, keg_path: &Path, name: &str) -> Result<(), Error> {
         let opt_link = self.opt_dir.join(name);
         if opt_link.symlink_metadata().is_ok() {
             if let Ok(target) = fs::read_link(&opt_link) {
@@ -888,6 +902,29 @@ mod tests {
         assert!(tmp.path().join("lib/libfoo.dylib").is_symlink());
         assert!(!tmp.path().join("lib/charset.alias").exists());
         assert!(!tmp.path().join("share/locale/locale.alias").exists());
+    }
+
+    #[test]
+    fn opt_links_aliases_and_old_names() {
+        let tmp = TempDir::new().unwrap();
+        let keg = setup_keg(&tmp, "pkgconf");
+        let linker = Linker::new(tmp.path()).unwrap();
+        linker
+            .link_opt(&keg, &["pkg-config".to_string(), "pkgconfig".to_string()])
+            .unwrap();
+
+        for name in ["pkgconf", "pkg-config", "pkgconfig"] {
+            let link = tmp.path().join("opt").join(name);
+            assert_eq!(
+                fs::canonicalize(&link).unwrap(),
+                fs::canonicalize(&keg).unwrap()
+            );
+        }
+
+        linker.unlink_keg(&keg).unwrap();
+        for name in ["pkgconf", "pkg-config", "pkgconfig"] {
+            assert!(tmp.path().join("opt").join(name).symlink_metadata().is_err());
+        }
     }
 
     #[test]

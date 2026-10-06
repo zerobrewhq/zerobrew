@@ -134,6 +134,13 @@ pub struct Formula {
     pub requirements: Vec<serde_json::Value>,
     #[serde(default)]
     pub variations: Option<serde_json::Value>,
+    /// Other names the formula goes by, like `pkg-config` for `pkgconf`.
+    /// Homebrew links each one under `opt/` too.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// Names the formula used to have, also linked under `opt/`.
+    #[serde(default)]
+    pub oldnames: Vec<String>,
 }
 
 impl Formula {
