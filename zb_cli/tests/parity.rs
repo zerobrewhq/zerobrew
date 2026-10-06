@@ -578,13 +578,10 @@ fn links_into(prefix: &Path, keg: &Path) -> BTreeMap<String, String> {
     links
 }
 
-/// The symlinks in the prefix match too, for every keg of every case.
-///
-/// Known gap: zerobrew links the files inside directories such as
-/// `include/lzma` one by one where Homebrew links the directory itself.
-/// Tracked in https://github.com/zerobrewhq/zerobrew/issues/423.
+/// The symlinks in the prefix match too, for every keg of every case: which
+/// paths are links and where they resolve. Directory links count, so a keg
+/// linked file by file where Homebrew links the directory shows up here.
 #[test]
-#[ignore = "known difference: include directories are linked per file, see https://github.com/zerobrewhq/zerobrew/issues/423"]
 fn links_match_homebrew() {
     let mut all_diffs = Vec::new();
     for case in CASES {
