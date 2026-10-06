@@ -85,17 +85,20 @@ const SHARED_LIB_DIR_PREFIXES: &[&str] = &[
     "ruby",
 ];
 
-/// `locale/<lang>` and `man/<lang>` directories, which many kegs share.
-/// Homebrew's `LOCALEDIR_RX`, without the regex.
+/// Whether `rel` is, or lies inside, a `locale/<lang>` or `man/<lang>`
+/// directory, which many kegs share. Homebrew's `LOCALEDIR_RX`, which is
+/// unanchored, so `locale/de/LC_MESSAGES` counts as well as `locale/de`.
 fn is_locale_dir(rel: &str) -> bool {
-    let Some((parent, lang)) = rel.rsplit_once('/') else {
-        return false;
-    };
-    if parent != "locale" && parent != "man" {
-        return false;
-    }
-    let lang = lang.split(['.', '@']).next().unwrap_or(lang);
-    let (lang, territory) = lang.split_once('_').unwrap_or((lang, ""));
+    let parts: Vec<&str> = rel.split('/').collect();
+    parts
+        .windows(2)
+        .any(|pair| (pair[0] == "locale" || pair[0] == "man") && is_locale_name(pair[1]))
+}
+
+/// `de`, `pt_BR`, `en_US.UTF-8`, `sr@latin`, `C`, `POSIX`.
+fn is_locale_name(name: &str) -> bool {
+    let name = name.split(['.', '@']).next().unwrap_or(name);
+    let (lang, territory) = name.split_once('_').unwrap_or((name, ""));
     let plain_lang = lang == "C"
         || lang == "POSIX"
         || (lang.len() == 2 && lang.bytes().all(|b| b.is_ascii_lowercase()));
@@ -107,6 +110,10 @@ fn is_locale_dir(rel: &str) -> bool {
 /// How Homebrew links the directory at `rel` inside the keg's `top` directory.
 fn dir_mode(top: &str, rel: &str) -> DirMode {
     let first = rel.split('/').next().unwrap_or(rel);
+    // Application bundles are never linked, whatever directory they're in.
+    if rel.ends_with(".app") {
+        return DirMode::Skip;
+    }
     match top {
         "etc" => DirMode::Mkpath,
         "bin" | "sbin" => DirMode::Skip,
@@ -295,7 +302,7 @@ impl Linker {
             // Use src_path.is_dir() which follows symlinks, so that keg entries
             // like `man -> ../gnuman` (symlinks to directories) are treated as dirs.
             if src_path.is_dir() {
-                if dir_mode(top, &entry_rel) == DirMode::Skip && !dst_path.is_dir() {
+                if dir_mode(top, &entry_rel) == DirMode::Skip {
                     continue;
                 }
                 // A plain file where a directory or directory link would go.
@@ -468,6 +475,10 @@ impl Linker {
             // like `man -> ../gnuman` (symlinks to directories) can be merged
             // into a directory the prefix already has.
             if src_path.is_dir() {
+                let mode = dir_mode(top, &entry_rel);
+                if mode == DirMode::Skip {
+                    continue;
+                }
                 let dst_meta = dst_path.symlink_metadata().ok();
                 let dst_is_symlink = dst_meta
                     .as_ref()
@@ -502,36 +513,28 @@ impl Linker {
                     continue;
                 }
 
-                if dst_is_dir {
+                if dst_is_dir || mode == DirMode::Mkpath {
                     linked.extend(Self::link_recursive(&src_path, &dst_path, top, &entry_rel)?);
                     continue;
                 }
 
-                match dir_mode(top, &entry_rel) {
-                    DirMode::Skip => continue,
-                    DirMode::Mkpath => {
-                        linked.extend(Self::link_recursive(&src_path, &dst_path, top, &entry_rel)?);
-                        continue;
-                    }
-                    DirMode::Link => {
-                        if dst_meta.is_some() {
-                            return Err(Error::LinkConflict {
-                                conflicts: vec![ConflictedLink {
-                                    path: dst_path,
-                                    owned_by: None,
-                                }],
-                            });
-                        }
-                        #[cfg(unix)]
-                        std::os::unix::fs::symlink(&src_path, &dst_path)
-                            .map_err(Error::store("failed to create symlink"))?;
-                        linked.push(LinkedFile {
-                            link_path: dst_path,
-                            target_path: src_path,
-                        });
-                        continue;
-                    }
+                // DirMode::Link
+                if dst_meta.is_some() {
+                    return Err(Error::LinkConflict {
+                        conflicts: vec![ConflictedLink {
+                            path: dst_path,
+                            owned_by: None,
+                        }],
+                    });
                 }
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&src_path, &dst_path)
+                    .map_err(Error::store("failed to create symlink"))?;
+                linked.push(LinkedFile {
+                    link_path: dst_path,
+                    target_path: src_path,
+                });
+                continue;
             }
 
             if is_skipped_file(top, &entry_rel) {
@@ -831,7 +834,6 @@ mod tests {
         // Whole directories.
         assert!(prefix.join("include/lzma").is_symlink());
         assert!(prefix.join("share/doc/xz").is_symlink());
-        assert!(prefix.join("share/locale/de/LC_MESSAGES").is_symlink());
         assert!(prefix.join("include/lzma/base.h").exists());
         // Shared directories are real, with their files linked.
         for dir in [
@@ -853,6 +855,11 @@ mod tests {
         assert!(prefix.join("lib/pkgconfig/liblzma.pc").is_symlink());
         assert!(prefix.join("share/man/man1/xz.1").is_symlink());
         assert!(prefix.join("etc/xz/xz.conf").is_symlink());
+        assert!(
+            prefix
+                .join("share/locale/de/LC_MESSAGES/xz.mo")
+                .is_symlink()
+        );
 
         linker.unlink_keg(&keg).unwrap();
         assert!(!prefix.join("include/lzma").exists());
@@ -884,6 +891,35 @@ mod tests {
     }
 
     #[test]
+    fn skips_app_bundles_and_leaves_skipped_destinations_alone() {
+        let tmp = TempDir::new().unwrap();
+        let keg = tmp.path().join("cellar/foo/1.0");
+        fs::create_dir_all(keg.join("share/applications/Foo.app/Contents")).unwrap();
+        fs::write(
+            keg.join("share/applications/Foo.app/Contents/Info.plist"),
+            b"plist",
+        )
+        .unwrap();
+        fs::create_dir_all(keg.join("bin/helpers")).unwrap();
+        fs::write(keg.join("bin/helpers/h"), b"h").unwrap();
+
+        // Something else already owns bin/helpers; a skipped directory must
+        // not be merged into or removed.
+        let other = tmp.path().join("elsewhere");
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(tmp.path().join("bin")).unwrap();
+        std::os::unix::fs::symlink(&other, tmp.path().join("bin/helpers")).unwrap();
+
+        let linker = Linker::new(tmp.path()).unwrap();
+        linker.link_keg(&keg).unwrap();
+
+        assert!(!tmp.path().join("share/applications/Foo.app").exists());
+        let helpers = tmp.path().join("bin/helpers");
+        assert!(helpers.is_symlink());
+        assert_eq!(fs::read_link(&helpers).unwrap(), other);
+    }
+
+    #[test]
     fn locale_dirs_are_recognised() {
         assert!(is_locale_dir("locale/de"));
         assert!(is_locale_dir("locale/pt_BR"));
@@ -891,6 +927,8 @@ mod tests {
         assert!(is_locale_dir("locale/en_US.UTF-8"));
         assert!(is_locale_dir("man/de"));
         assert!(is_locale_dir("locale/C"));
+        assert!(is_locale_dir("locale/de/LC_MESSAGES"));
+        assert!(is_locale_dir("gettext/locale/de"));
         assert!(!is_locale_dir("locale/German"));
         assert!(!is_locale_dir("doc/de"));
         assert!(!is_locale_dir("locale"));
