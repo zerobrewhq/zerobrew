@@ -6,6 +6,13 @@
 //! tests skip, unless `ZB_PARITY_REQUIRE_BREW` is set, in which case they fail.
 //! CI sets that so a missing Homebrew can't silently turn the suite off.
 //!
+//! The tests share the runner's Homebrew, which locks per command, so they are
+//! behind the `parity` feature and run one at a time:
+//!
+//!     cargo test -p zb_cli --features parity --test parity -- --test-threads=1
+//!
+//! A plain `cargo test --workspace` leaves them out.
+//!
 //! macOS only for now: binaries are compared through `otool` and `codesign`.
 #![cfg(target_os = "macos")]
 

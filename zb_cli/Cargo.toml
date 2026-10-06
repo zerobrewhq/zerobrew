@@ -4,6 +4,10 @@ version.workspace = true
 edition = "2024"
 rust-version.workspace = true
 
+[features]
+# Compares installed prefixes against a real Homebrew; needs `brew` and
+# network access, so it only runs when asked for. See tests/parity.rs.
+parity = []
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
@@ -29,3 +33,7 @@ tar.workspace = true
 flate2.workspace = true
 sha2.workspace = true
 walkdir.workspace = true
+
+[[test]]
+name = "parity"
+required-features = ["parity"]

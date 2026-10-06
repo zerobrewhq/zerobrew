@@ -59,4 +59,4 @@ jobs:
           ZB_PARITY_REQUIRE_BREW: "1"
         # One at a time: the tests share the runner's Homebrew, and brew takes
         # a lock per install.
-        run: cargo test --package zb_cli --test parity -- --nocapture --test-threads=1
+        run: cargo test --package zb_cli --features parity --test parity -- --nocapture --test-threads=1
