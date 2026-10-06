@@ -13,6 +13,142 @@ const LINK_DIRS: &[&str] = &["bin", "sbin", "lib", "include", "share", "etc"];
 /// links are cleaned up on uninstall and upgrade.
 const LEGACY_LINK_DIRS: &[&str] = &["libexec"];
 
+/// How a directory inside a keg is linked into the prefix, following
+/// Homebrew's `Keg#link` rules so the two tools produce the same prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirMode {
+    /// Not linked at all, such as a subdirectory of `bin`.
+    Skip,
+    /// A real directory is created and its contents linked one by one. Used
+    /// where several kegs share a directory, like `lib/pkgconfig`.
+    Mkpath,
+    /// The directory itself becomes one symlink, like `include/lzma`.
+    Link,
+}
+
+/// Directories under `share` that several kegs populate, so they're created
+/// rather than linked. Homebrew's `SHARE_PATHS`.
+const SHARED_SHARE_DIRS: &[&str] = &[
+    "aclocal",
+    "cps",
+    "doc",
+    "info",
+    "java",
+    "locale",
+    "man",
+    "man/man1",
+    "man/man2",
+    "man/man3",
+    "man/man4",
+    "man/man5",
+    "man/man6",
+    "man/man7",
+    "man/man8",
+    "man/cat1",
+    "man/cat2",
+    "man/cat3",
+    "man/cat4",
+    "man/cat5",
+    "man/cat6",
+    "man/cat7",
+    "man/cat8",
+    "applications",
+    "gnome",
+    "gnome/help",
+    "icons",
+    "mime",
+    "mime/packages",
+    "mime-info",
+    "pixmaps",
+    "postgresql",
+    "sounds",
+];
+
+/// Directories under `lib` that several kegs populate.
+const SHARED_LIB_DIRS: &[&str] = &["cps", "pkgconfig", "cmake", "dtrace", "ghc", "php"];
+
+/// Directories under `lib` whose name starts with one of these are shared too:
+/// language module trees like `python3.13/site-packages`.
+const SHARED_LIB_DIR_PREFIXES: &[&str] = &[
+    "gdk-pixbuf",
+    "gio",
+    "lua",
+    "mecab",
+    "node",
+    "ocaml",
+    "perl5",
+    "postgresql@",
+    "pypy",
+    "python2.",
+    "python3.",
+    "R",
+    "ruby",
+];
+
+/// `locale/<lang>` and `man/<lang>` directories, which many kegs share.
+/// Homebrew's `LOCALEDIR_RX`, without the regex.
+fn is_locale_dir(rel: &str) -> bool {
+    let Some((parent, lang)) = rel.rsplit_once('/') else {
+        return false;
+    };
+    if parent != "locale" && parent != "man" {
+        return false;
+    }
+    let lang = lang.split(['.', '@']).next().unwrap_or(lang);
+    let (lang, territory) = lang.split_once('_').unwrap_or((lang, ""));
+    let plain_lang = lang == "C"
+        || lang == "POSIX"
+        || (lang.len() == 2 && lang.bytes().all(|b| b.is_ascii_lowercase()));
+    let plain_territory = territory.is_empty()
+        || (territory.len() == 2 && territory.bytes().all(|b| b.is_ascii_uppercase()));
+    plain_lang && plain_territory
+}
+
+/// How Homebrew links the directory at `rel` inside the keg's `top` directory.
+fn dir_mode(top: &str, rel: &str) -> DirMode {
+    let first = rel.split('/').next().unwrap_or(rel);
+    match top {
+        "etc" => DirMode::Mkpath,
+        "bin" | "sbin" => DirMode::Skip,
+        "include" if first.starts_with("postgresql@") => DirMode::Mkpath,
+        "include" => DirMode::Link,
+        "share"
+            if SHARED_SHARE_DIRS.contains(&rel)
+                || is_locale_dir(rel)
+                || first == "icons"
+                || first.starts_with("zsh")
+                || first.starts_with("fish")
+                || first.starts_with("pwsh")
+                || first == "lua"
+                || first == "guile"
+                || first.starts_with("postgresql@")
+                || first.starts_with("pypy") =>
+        {
+            DirMode::Mkpath
+        }
+        "share" => DirMode::Link,
+        "lib"
+            if SHARED_LIB_DIRS.contains(&rel)
+                || SHARED_LIB_DIR_PREFIXES.iter().any(|p| rel.starts_with(p)) =>
+        {
+            DirMode::Mkpath
+        }
+        "lib" => DirMode::Link,
+        _ => DirMode::Mkpath,
+    }
+}
+
+/// Files Homebrew leaves out of the prefix: generated caches that every keg
+/// ships its own copy of.
+fn is_skipped_file(top: &str, rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    name == ".DS_Store"
+        || (top == "lib" && rel == "charset.alias")
+        || (top == "share" && rel == "locale/locale.alias")
+        || (top == "share" && rel.starts_with("icons/") && name == "icon-theme.cache")
+        || (rel.contains("/site-packages/") && (name.ends_with(".pyc") || name.ends_with(".pyo")))
+}
+
 pub struct Linker {
     prefix: PathBuf,
     bin_dir: PathBuf,
@@ -124,7 +260,7 @@ impl Linker {
             let src_dir = keg_path.join(dir_name);
             let dst_dir = self.prefix.join(dir_name);
             if src_dir.exists() {
-                Self::collect_conflicts(&src_dir, &dst_dir, &mut conflicts);
+                Self::collect_conflicts(&src_dir, &dst_dir, dir_name, "", &mut conflicts);
             }
         }
         if conflicts.is_empty() {
@@ -134,7 +270,13 @@ impl Linker {
         }
     }
 
-    fn collect_conflicts(src: &Path, dst: &Path, conflicts: &mut Vec<ConflictedLink>) {
+    fn collect_conflicts(
+        src: &Path,
+        dst: &Path,
+        top: &str,
+        rel: &str,
+        conflicts: &mut Vec<ConflictedLink>,
+    ) {
         let entries = match fs::read_dir(src) {
             Ok(e) => e,
             Err(_) => return,
@@ -144,10 +286,26 @@ impl Linker {
 
             let src_path = entry.path();
             let dst_path = dst.join(&file_name);
+            let entry_rel = if rel.is_empty() {
+                file_name.to_string_lossy().into_owned()
+            } else {
+                format!("{rel}/{}", file_name.to_string_lossy())
+            };
 
             // Use src_path.is_dir() which follows symlinks, so that keg entries
             // like `man -> ../gnuman` (symlinks to directories) are treated as dirs.
             if src_path.is_dir() {
+                if dir_mode(top, &entry_rel) == DirMode::Skip && !dst_path.is_dir() {
+                    continue;
+                }
+                // A plain file where a directory or directory link would go.
+                if dst_path.is_file() {
+                    conflicts.push(ConflictedLink {
+                        path: dst_path,
+                        owned_by: None,
+                    });
+                    continue;
+                }
                 // When the destination is a symlink to a directory, actual linking will
                 // expand it into individual file symlinks. Check the expanded contents.
                 if dst_path.symlink_metadata().is_ok()
@@ -159,10 +317,16 @@ impl Linker {
                     } else {
                         old_target
                     };
-                    Self::collect_conflicts_merged(&src_path, &resolved, &dst_path, conflicts);
+                    Self::collect_conflicts_merged(
+                        &src_path, &resolved, &dst_path, top, &entry_rel, conflicts,
+                    );
                     continue;
                 }
-                Self::collect_conflicts(&src_path, &dst_path, conflicts);
+                Self::collect_conflicts(&src_path, &dst_path, top, &entry_rel, conflicts);
+                continue;
+            }
+
+            if is_skipped_file(top, &entry_rel) {
                 continue;
             }
 
@@ -200,6 +364,8 @@ impl Linker {
         src: &Path,
         old_target: &Path,
         dst: &Path,
+        top: &str,
+        rel: &str,
         conflicts: &mut Vec<ConflictedLink>,
     ) {
         let new_entries = match fs::read_dir(src) {
@@ -212,13 +378,25 @@ impl Linker {
             let src_path = entry.path();
             let matching_old = old_target.join(&file_name);
             let dst_path = dst.join(&file_name);
+            let entry_rel = format!("{rel}/{}", file_name.to_string_lossy());
 
             if src_path.is_dir() {
                 if matching_old.exists() {
-                    Self::collect_conflicts_merged(&src_path, &matching_old, &dst_path, conflicts);
+                    Self::collect_conflicts_merged(
+                        &src_path,
+                        &matching_old,
+                        &dst_path,
+                        top,
+                        &entry_rel,
+                        conflicts,
+                    );
                 } else {
-                    Self::collect_conflicts(&src_path, &dst_path, conflicts);
+                    Self::collect_conflicts(&src_path, &dst_path, top, &entry_rel, conflicts);
                 }
+                continue;
+            }
+
+            if is_skipped_file(top, &entry_rel) {
                 continue;
             }
 
@@ -249,13 +427,26 @@ impl Linker {
             let src_dir = keg_path.join(dir_name);
             let dst_dir = self.prefix.join(dir_name);
             if src_dir.exists() {
-                linked.extend(Self::link_recursive(&src_dir, &dst_dir)?);
+                linked.extend(Self::link_recursive(&src_dir, &dst_dir, dir_name, "")?);
             }
         }
         Ok(linked)
     }
 
-    fn link_recursive(src: &Path, dst: &Path) -> Result<Vec<LinkedFile>, Error> {
+    /// Link the contents of `src`, a directory `rel` below the keg's `top`
+    /// directory, into `dst`.
+    ///
+    /// Directories follow Homebrew's rules (see [`dir_mode`]): most become a
+    /// single symlink, shared ones are created and filled one entry at a time.
+    /// Where the prefix already has a real directory, or another keg's
+    /// directory symlink, the contents are merged file by file instead. Homebrew
+    /// reports the latter as a conflict; zerobrew keeps both kegs usable.
+    fn link_recursive(
+        src: &Path,
+        dst: &Path,
+        top: &str,
+        rel: &str,
+    ) -> Result<Vec<LinkedFile>, Error> {
         let mut linked = Vec::new();
         if !dst.exists() {
             fs::create_dir_all(dst).map_err(Error::store("failed to create directory"))?;
@@ -267,12 +458,23 @@ impl Linker {
 
             let src_path = entry.path();
             let dst_path = dst.join(&file_name);
+            let entry_rel = if rel.is_empty() {
+                file_name.to_string_lossy().into_owned()
+            } else {
+                format!("{rel}/{}", file_name.to_string_lossy())
+            };
 
             // Use src_path.is_dir() which follows symlinks, so that keg entries
-            // like `man -> ../gnuman` (symlinks to directories) are expanded
-            // into individual file symlinks instead of conflicting.
+            // like `man -> ../gnuman` (symlinks to directories) can be merged
+            // into a directory the prefix already has.
             if src_path.is_dir() {
-                if dst_path.symlink_metadata().is_ok() && dst_path.is_symlink() {
+                let dst_meta = dst_path.symlink_metadata().ok();
+                let dst_is_symlink = dst_meta
+                    .as_ref()
+                    .is_some_and(|m| m.file_type().is_symlink());
+                let dst_is_dir = dst_meta.as_ref().is_some_and(|m| m.is_dir());
+
+                if dst_is_symlink {
                     let target = fs::read_link(&dst_path)
                         .map_err(Error::store("failed to read symlink target"))?;
                     let old_target = if target.is_relative() {
@@ -280,14 +482,59 @@ impl Linker {
                     } else {
                         target
                     };
+                    if fs::canonicalize(&old_target).ok() == fs::canonicalize(&src_path).ok() {
+                        // Already linked as a directory.
+                        linked.push(LinkedFile {
+                            link_path: dst_path,
+                            target_path: src_path,
+                        });
+                        continue;
+                    }
+                    // Another keg owns this directory: expand its symlink into
+                    // file links so both kegs' contents fit.
                     let _ = fs::remove_file(&dst_path);
                     // A dangling directory symlink (e.g. the old keg was
                     // removed) has nothing left to expand.
                     if old_target.exists() {
-                        Self::link_recursive(&old_target, &dst_path)?;
+                        Self::link_recursive(&old_target, &dst_path, top, &entry_rel)?;
+                    }
+                    linked.extend(Self::link_recursive(&src_path, &dst_path, top, &entry_rel)?);
+                    continue;
+                }
+
+                if dst_is_dir {
+                    linked.extend(Self::link_recursive(&src_path, &dst_path, top, &entry_rel)?);
+                    continue;
+                }
+
+                match dir_mode(top, &entry_rel) {
+                    DirMode::Skip => continue,
+                    DirMode::Mkpath => {
+                        linked.extend(Self::link_recursive(&src_path, &dst_path, top, &entry_rel)?);
+                        continue;
+                    }
+                    DirMode::Link => {
+                        if dst_meta.is_some() {
+                            return Err(Error::LinkConflict {
+                                conflicts: vec![ConflictedLink {
+                                    path: dst_path,
+                                    owned_by: None,
+                                }],
+                            });
+                        }
+                        #[cfg(unix)]
+                        std::os::unix::fs::symlink(&src_path, &dst_path)
+                            .map_err(Error::store("failed to create symlink"))?;
+                        linked.push(LinkedFile {
+                            link_path: dst_path,
+                            target_path: src_path,
+                        });
+                        continue;
                     }
                 }
-                linked.extend(Self::link_recursive(&src_path, &dst_path)?);
+            }
+
+            if is_skipped_file(top, &entry_rel) {
                 continue;
             }
 
@@ -549,6 +796,131 @@ mod tests {
         linker.link_keg(&keg).unwrap();
 
         assert!(tmp.path().join("sbin/php-fpm").is_symlink());
+    }
+
+    /// Homebrew links `include/<pkg>` and `share/doc/<pkg>` as one symlink
+    /// each, and creates shared directories like `lib/pkgconfig` and
+    /// `share/man/man1` as real directories. See
+    /// https://github.com/zerobrewhq/zerobrew/issues/423
+    #[test]
+    fn links_directories_the_way_homebrew_does() {
+        let tmp = TempDir::new().unwrap();
+        let keg = tmp.path().join("cellar/xz/5.8.4");
+        for dir in [
+            "include/lzma",
+            "lib/pkgconfig",
+            "share/doc/xz",
+            "share/man/man1",
+            "share/locale/de/LC_MESSAGES",
+            "etc/xz",
+        ] {
+            fs::create_dir_all(keg.join(dir)).unwrap();
+        }
+        fs::write(keg.join("include/lzma.h"), b"h").unwrap();
+        fs::write(keg.join("include/lzma/base.h"), b"h").unwrap();
+        fs::write(keg.join("lib/pkgconfig/liblzma.pc"), b"pc").unwrap();
+        fs::write(keg.join("share/doc/xz/README"), b"doc").unwrap();
+        fs::write(keg.join("share/man/man1/xz.1"), b"man").unwrap();
+        fs::write(keg.join("share/locale/de/LC_MESSAGES/xz.mo"), b"mo").unwrap();
+        fs::write(keg.join("etc/xz/xz.conf"), b"conf").unwrap();
+
+        let linker = Linker::new(tmp.path()).unwrap();
+        linker.link_keg(&keg).unwrap();
+
+        let prefix = tmp.path();
+        // Whole directories.
+        assert!(prefix.join("include/lzma").is_symlink());
+        assert!(prefix.join("share/doc/xz").is_symlink());
+        assert!(prefix.join("share/locale/de/LC_MESSAGES").is_symlink());
+        assert!(prefix.join("include/lzma/base.h").exists());
+        // Shared directories are real, with their files linked.
+        for dir in [
+            "include",
+            "lib/pkgconfig",
+            "share/doc",
+            "share/man/man1",
+            "share/locale/de",
+            "etc/xz",
+        ] {
+            let dir = prefix.join(dir);
+            assert!(
+                dir.is_dir() && !dir.is_symlink(),
+                "{} should be a real directory",
+                dir.display()
+            );
+        }
+        assert!(prefix.join("include/lzma.h").is_symlink());
+        assert!(prefix.join("lib/pkgconfig/liblzma.pc").is_symlink());
+        assert!(prefix.join("share/man/man1/xz.1").is_symlink());
+        assert!(prefix.join("etc/xz/xz.conf").is_symlink());
+
+        linker.unlink_keg(&keg).unwrap();
+        assert!(!prefix.join("include/lzma").exists());
+        assert!(!prefix.join("share/doc/xz").exists());
+        assert!(!prefix.join("lib/pkgconfig/liblzma.pc").exists());
+    }
+
+    #[test]
+    fn skips_bin_subdirectories_and_generated_caches() {
+        let tmp = TempDir::new().unwrap();
+        let keg = tmp.path().join("cellar/foo/1.0");
+        fs::create_dir_all(keg.join("bin/helpers")).unwrap();
+        fs::write(keg.join("bin/foo"), b"foo").unwrap();
+        fs::write(keg.join("bin/helpers/foo-helper"), b"helper").unwrap();
+        fs::create_dir_all(keg.join("lib")).unwrap();
+        fs::write(keg.join("lib/charset.alias"), b"alias").unwrap();
+        fs::write(keg.join("lib/libfoo.dylib"), b"lib").unwrap();
+        fs::create_dir_all(keg.join("share/locale")).unwrap();
+        fs::write(keg.join("share/locale/locale.alias"), b"alias").unwrap();
+
+        let linker = Linker::new(tmp.path()).unwrap();
+        linker.link_keg(&keg).unwrap();
+
+        assert!(tmp.path().join("bin/foo").is_symlink());
+        assert!(!tmp.path().join("bin/helpers").exists());
+        assert!(tmp.path().join("lib/libfoo.dylib").is_symlink());
+        assert!(!tmp.path().join("lib/charset.alias").exists());
+        assert!(!tmp.path().join("share/locale/locale.alias").exists());
+    }
+
+    #[test]
+    fn locale_dirs_are_recognised() {
+        assert!(is_locale_dir("locale/de"));
+        assert!(is_locale_dir("locale/pt_BR"));
+        assert!(is_locale_dir("locale/sr@latin"));
+        assert!(is_locale_dir("locale/en_US.UTF-8"));
+        assert!(is_locale_dir("man/de"));
+        assert!(is_locale_dir("locale/C"));
+        assert!(!is_locale_dir("locale/German"));
+        assert!(!is_locale_dir("doc/de"));
+        assert!(!is_locale_dir("locale"));
+    }
+
+    /// A second keg adding to a directory the first keg owns as a symlink
+    /// gets the symlink expanded so both sets of files are reachable.
+    #[test]
+    fn second_keg_merges_into_a_linked_directory() {
+        let tmp = TempDir::new().unwrap();
+        let keg1 = tmp.path().join("cellar/a/1.0");
+        let keg2 = tmp.path().join("cellar/b/1.0");
+        fs::create_dir_all(keg1.join("include/shared")).unwrap();
+        fs::create_dir_all(keg2.join("include/shared")).unwrap();
+        fs::write(keg1.join("include/shared/a.h"), b"a").unwrap();
+        fs::write(keg2.join("include/shared/b.h"), b"b").unwrap();
+
+        let linker = Linker::new(tmp.path()).unwrap();
+        linker.link_keg(&keg1).unwrap();
+        assert!(tmp.path().join("include/shared").is_symlink());
+        linker.link_keg(&keg2).unwrap();
+
+        let shared = tmp.path().join("include/shared");
+        assert!(shared.is_dir() && !shared.is_symlink());
+        assert!(shared.join("a.h").is_symlink());
+        assert!(shared.join("b.h").is_symlink());
+
+        linker.unlink_keg(&keg1).unwrap();
+        assert!(!shared.join("a.h").exists());
+        assert!(shared.join("b.h").exists());
     }
 
     #[test]

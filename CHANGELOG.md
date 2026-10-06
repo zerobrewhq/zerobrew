@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - When a bottle pinned to `/opt/homebrew` is installed under a custom prefix, rewrite the hardcoded paths in every binary file, not only Mach-O ones, so static libraries like `pkgconf`'s `libpkgconf.a` no longer point at `/opt/homebrew`. A shorter prefix is now padded with `/` instead of NUL, which cut such paths off at the prefix. Found by the parity harness ([#421](https://github.com/zerobrewhq/zerobrew/issues/421))
+- Link directories the way Homebrew does: `include/<pkg>`, `share/doc/<pkg>` and the like become one symlink, while shared directories such as `lib/pkgconfig`, `share/man/man1` and `lib/python3.x` are real directories filled file by file. Subdirectories of `bin` and generated caches like `lib/charset.alias` are no longer linked. Existing prefixes keep working: a second keg adding to a linked directory still gets merged in ([#423](https://github.com/zerobrewhq/zerobrew/issues/423))
 
 ## [0.3.5] - 2026-09-30
 
