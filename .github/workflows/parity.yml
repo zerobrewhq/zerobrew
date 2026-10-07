@@ -5,9 +5,11 @@
 # changed. See https://github.com/zerobrewhq/zerobrew/issues/421.
 #
 # timing: installs every case cold with both tools and compares wall-clock
-# time. Its own job, so nothing is cached for either tool. Nightly runs fail
-# when zb is not at least ZB_TIMING_MIN_SPEEDUP times faster; pull requests
-# only report. See https://github.com/zerobrewhq/zerobrew/issues/422.
+# time, and times the last release too. Its own job, so nothing is cached for
+# either tool. Nightly runs fail when zb is not at least ZB_TIMING_MIN_SPEEDUP
+# times faster than Homebrew on any case, or more than ZB_TIMING_MAX_REGRESSION
+# times slower than the last release over all cases; pull requests only report.
+# See https://github.com/zerobrewhq/zerobrew/issues/422.
 name: parity
 
 on:
@@ -89,10 +91,22 @@ jobs:
       - name: homebrew version
         run: brew --version
 
+      # The last release is timed in the same run, which is the only
+      # comparison that holds on hosted runners.
+      - name: download the last release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo "$GITHUB_REPOSITORY" --pattern zb-darwin-arm64 --output /tmp/zb-release
+          chmod +x /tmp/zb-release
+          /tmp/zb-release --version
+
       # Release build: a debug zb is several times slower and would measure
       # the compiler, not the tool.
       - name: time installs
         env:
           ZB_PARITY_REQUIRE_BREW: "1"
+          ZB_TIMING_BASELINE: /tmp/zb-release
           ZB_TIMING_MIN_SPEEDUP: ${{ github.event_name == 'schedule' && '1.5' || '' }}
+          ZB_TIMING_MAX_REGRESSION: ${{ github.event_name == 'schedule' && '1.2' || '' }}
         run: cargo test --release --package zb_cli --features parity --test parity -- --nocapture install_timings

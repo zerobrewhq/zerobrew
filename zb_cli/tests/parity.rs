@@ -118,6 +118,8 @@ impl Brew {
 }
 
 struct Zb {
+    /// The `zb` under test, or a released one when timing a baseline.
+    bin: PathBuf,
     root: tempfile::TempDir,
     /// Short on purpose: Mach-O patching needs a prefix no longer than
     /// `/opt/homebrew`, and the default temp dir on macOS is far longer.
@@ -126,7 +128,12 @@ struct Zb {
 
 impl Zb {
     fn new() -> Self {
+        Self::with_binary(PathBuf::from(env!("CARGO_BIN_EXE_zb")))
+    }
+
+    fn with_binary(bin: PathBuf) -> Self {
         Self {
+            bin,
             root: tempfile::TempDir::new().expect("failed to create temp dir"),
             prefix_dir: tempfile::Builder::new()
                 .prefix("zb")
@@ -141,14 +148,13 @@ impl Zb {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        let zb = env!("CARGO_BIN_EXE_zb");
-        Command::new(zb)
+        Command::new(&self.bin)
             .env("ZEROBREW_ROOT", self.root.path())
             .env("ZEROBREW_PREFIX", self.prefix())
             .env("ZEROBREW_AUTO_INIT", "true")
             .args(args)
             .output()
-            .unwrap_or_else(|e| panic!("failed to run {zb}: {e}"))
+            .unwrap_or_else(|e| panic!("failed to run {}: {e}", self.bin.display()))
     }
 
     fn install(&self, formula: &str) -> PathBuf {
@@ -630,15 +636,54 @@ fn min_speedup() -> Option<f64> {
     )
 }
 
+/// How much slower than the last release `zb install` may be, per case, as
+/// a ratio. Read from `ZB_TIMING_MAX_REGRESSION`; unset means report only.
+/// Only checked when `ZB_TIMING_BASELINE` names a released `zb`.
+fn max_regression() -> Option<f64> {
+    let raw = std::env::var("ZB_TIMING_MAX_REGRESSION").ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(
+        raw.trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("ZB_TIMING_MAX_REGRESSION={raw:?} is not a number: {e}")),
+    )
+}
+
+/// A released `zb` to time alongside the one under test, named by
+/// `ZB_TIMING_BASELINE`. Comparing two zb builds in the same run is the only
+/// way to see a regression on hosted runners, whose speed varies run to run.
+fn baseline_zb() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("ZB_TIMING_BASELINE")?);
+    assert!(
+        path.is_file(),
+        "ZB_TIMING_BASELINE={} is not a file",
+        path.display()
+    );
+    Some(path)
+}
+
+/// How many times each zb build installs each case; the fastest run counts.
+const ZB_TIMING_ROUNDS: usize = 3;
+
 struct Timing {
     formula: &'static str,
     brew: Duration,
     zb: Duration,
+    /// The last release's time, when a baseline was given.
+    baseline: Option<Duration>,
 }
 
 impl Timing {
     fn speedup(&self) -> f64 {
         self.brew.as_secs_f64() / self.zb.as_secs_f64()
+    }
+
+    /// Current time over the last release's: above 1 means slower.
+    fn regression(&self) -> Option<f64> {
+        self.baseline
+            .map(|baseline| self.zb.as_secs_f64() / baseline.as_secs_f64())
     }
 }
 
@@ -685,16 +730,35 @@ fn timed<T>(f: impl FnOnce() -> T) -> (T, Duration) {
 }
 
 fn timing_table(timings: &[Timing]) -> String {
-    let mut table =
-        String::from("| formula | homebrew | zerobrew | speedup |\n|---|---:|---:|---:|\n");
+    let with_baseline = timings.iter().any(|t| t.baseline.is_some());
+    let mut table = String::from("| formula | homebrew | zerobrew | speedup |");
+    if with_baseline {
+        table.push_str(" last release | vs release |");
+    }
+    table.push_str("\n|---|---:|---:|---:|");
+    if with_baseline {
+        table.push_str("---:|---:|");
+    }
+    table.push('\n');
     for t in timings {
         table.push_str(&format!(
-            "| {} | {:.2}s | {:.2}s | {:.1}x |\n",
+            "| {} | {:.2}s | {:.2}s | {:.1}x |",
             t.formula,
             t.brew.as_secs_f64(),
             t.zb.as_secs_f64(),
             t.speedup()
         ));
+        if with_baseline {
+            match (t.baseline, t.regression()) {
+                (Some(baseline), Some(ratio)) => table.push_str(&format!(
+                    " {:.2}s | {:+.0}% |",
+                    baseline.as_secs_f64(),
+                    (ratio - 1.0) * 100.0
+                )),
+                _ => table.push_str(" - | - |"),
+            }
+        }
+        table.push('\n');
     }
     table
 }
@@ -727,12 +791,34 @@ fn install_timings() {
                 &format!("brew install {}", case.formula),
             )
         });
-        let zb = Zb::new();
-        let (_, zb_time) = timed(|| zb.install(case.formula));
+        // zb installs are short enough to repeat. Each round installs into a
+        // fresh root with the build under test and the release in alternating
+        // order, so neither always gets the warmer CDN edge, and the fastest
+        // run counts: the slowest ones are the network, not the tool.
+        let release = baseline_zb();
+        let mut zb_times = Vec::new();
+        let mut baseline_times = Vec::new();
+        for round in 0..ZB_TIMING_ROUNDS {
+            let time_current = || timed(|| Zb::new().install(case.formula)).1;
+            let time_release =
+                |bin: &PathBuf| timed(|| Zb::with_binary(bin.clone()).install(case.formula)).1;
+            match &release {
+                Some(bin) if round % 2 == 1 => {
+                    baseline_times.push(time_release(bin));
+                    zb_times.push(time_current());
+                }
+                Some(bin) => {
+                    zb_times.push(time_current());
+                    baseline_times.push(time_release(bin));
+                }
+                None => zb_times.push(time_current()),
+            }
+        }
         timings.push(Timing {
             formula: case.formula,
             brew: brew_time,
-            zb: zb_time,
+            zb: zb_times.into_iter().min().unwrap(),
+            baseline: baseline_times.into_iter().min(),
         });
     }
 
@@ -758,5 +844,23 @@ fn install_timings() {
             "zb install is not {min}x faster than Homebrew for:\n{}",
             slow.join("\n")
         );
+    }
+
+    if let Some(max) = max_regression() {
+        // One number for the whole set: a real slowdown shows up in every
+        // case, a network hiccup in one.
+        let (current, release): (f64, f64) = timings
+            .iter()
+            .filter_map(|t| t.baseline.map(|b| (t.zb.as_secs_f64(), b.as_secs_f64())))
+            .fold((0.0, 0.0), |(c, r), (zb, b)| (c + zb, r + b));
+        if release > 0.0 {
+            let ratio = current / release;
+            assert!(
+                ratio <= max,
+                "zb install is {:+.0}% slower than the last release over all cases (limit {:+.0}%)\n{table}",
+                (ratio - 1.0) * 100.0,
+                (max - 1.0) * 100.0
+            );
+        }
     }
 }
