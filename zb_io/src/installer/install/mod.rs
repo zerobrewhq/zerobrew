@@ -10,6 +10,8 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use tokio::sync::Semaphore;
 use tracing::warn;
 
 use crate::cellar::link::Linker;
@@ -22,9 +24,9 @@ use crate::storage::blob::BlobCache;
 use crate::storage::db::Database;
 use crate::storage::store::Store;
 
-use zb_core::{Error, Formula, InstallMethod};
+use zb_core::{ConcurrencyLimits, Error, Formula, InstallMethod};
 
-use bottle::dependency_cellar_path;
+use bottle::{BottleJob, dependency_cellar_path, prepare_bottle};
 
 const MAX_CORRUPTION_RETRIES: usize = 3;
 
@@ -72,6 +74,7 @@ pub struct PlanFailure {
     pub error: Error,
 }
 
+#[derive(Debug)]
 pub struct ExecuteResult {
     pub installed: usize,
 }
@@ -188,26 +191,59 @@ impl Installer {
                 .downloader
                 .download_streaming(requests, download_progress.clone());
 
-            while let Some(result) = rx.recv().await {
-                match result {
-                    Ok(download) => {
-                        match self
-                            .process_bottle_item(
-                                &bottle_items[download.index],
-                                &download,
-                                &download_progress,
-                                link,
-                                &report,
-                            )
-                            .await
-                        {
-                            Ok(()) => installed += 1,
-                            Err(e) => error = Some(e),
+            // Bottles are unpacked and relocated as they arrive, several at
+            // a time, while the rest are still downloading. Only the final
+            // step (clone into the Cellar, record, link) runs here, one
+            // bottle at a time.
+            let prepare_limit = Arc::new(Semaphore::new(ConcurrencyLimits::default().materialize));
+            let mut preparing = FuturesUnordered::new();
+            let mut downloads_open = true;
+
+            while downloads_open || !preparing.is_empty() {
+                tokio::select! {
+                    result = rx.recv(), if downloads_open => match result {
+                        None => downloads_open = false,
+                        Some(Err(e)) => error = Some(e),
+                        Some(Ok(download)) => {
+                            let job = BottleJob::new(download.index, &bottle_items[download.index]);
+                            report(InstallProgress::UnpackStarted {
+                                name: job.formula_name.clone(),
+                            });
+                            let store = self.store.clone();
+                            let cellar = self.cellar.clone();
+                            let downloader = self.downloader.clone();
+                            let progress = download_progress.clone();
+                            let limit = prepare_limit.clone();
+                            preparing.push(tokio::spawn(async move {
+                                let _permit = limit.acquire_owned().await;
+                                let index = job.index;
+                                let outcome = prepare_bottle(
+                                    store,
+                                    cellar,
+                                    downloader,
+                                    job,
+                                    download.blob_path,
+                                    progress,
+                                )
+                                .await;
+                                (index, outcome)
+                            }));
                         }
-                    }
-                    Err(e) => {
-                        error = Some(e);
-                    }
+                    },
+                    Some(joined) = preparing.next() => match joined {
+                        Ok((index, Ok(entry))) => {
+                            match self.finish_bottle_item(&bottle_items[index], &entry, link, &report) {
+                                Ok(()) => installed += 1,
+                                Err(e) => error = Some(e),
+                            }
+                        }
+                        Ok((_, Err(e))) => error = Some(e),
+                        Err(e) => {
+                            error = Some(Error::ExecutionError {
+                                message: format!("bottle preparation task failed: {e}"),
+                            })
+                        }
+                    },
                 }
             }
         }
@@ -1183,6 +1219,78 @@ end
         assert!(root.join("cellar/slowpkg/1.0.0").exists());
         assert!(prefix.join("bin/fastpkg").exists());
         assert!(prefix.join("bin/slowpkg").exists());
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_bottle_fails_alone_after_its_retries() {
+        let mock_server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+
+        let good_bottle = create_bottle_tarball("goodpkg");
+        // Right checksum, but not a tarball: unpacking fails every time.
+        let corrupt_bottle = b"this is not a gzip stream".to_vec();
+
+        let tag = get_test_bottle_tag();
+        let formula = |name: &str, sha: &str| {
+            format!(
+                r#"{{"name":"{name}","versions":{{"stable":"1.0.0"}},"dependencies":[],"bottle":{{"stable":{{"files":{{"{tag}":{{"url":"{}/bottles/{name}.tar.gz","sha256":"{sha}"}}}}}}}}}}"#,
+                mock_server.uri()
+            )
+        };
+        for (name, bottle) in [("goodpkg", &good_bottle), ("corruptpkg", &corrupt_bottle)] {
+            Mock::given(method("GET"))
+                .and(path(format!("/formula/{name}.json")))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(formula(name, &sha256_hex(bottle))),
+                )
+                .mount(&mock_server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/bottles/{name}.tar.gz")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bottle.clone()))
+                .mount(&mock_server)
+                .await;
+        }
+
+        let root = tmp.path().join("zerobrew");
+        let prefix = tmp.path().join("homebrew");
+        fs::create_dir_all(root.join("db")).unwrap();
+        let mut installer = Installer::new(
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap(),
+            BlobCache::new(&root.join("cache")).unwrap(),
+            Store::new(&root).unwrap(),
+            Cellar::new(&root).unwrap(),
+            Linker::new(&prefix).unwrap(),
+            Database::open(&root.join("db/zb.sqlite3")).unwrap(),
+            prefix.clone(),
+            root.join("locks"),
+        );
+
+        let err = installer
+            .install(&["goodpkg".to_string(), "corruptpkg".to_string()], true)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("attempts"), "{err}");
+        assert!(installer.db.get_installed("goodpkg").is_some());
+        assert!(prefix.join("bin/goodpkg").exists());
+        assert!(installer.db.get_installed("corruptpkg").is_none());
+        assert!(!root.join("cellar/corruptpkg").exists());
+        let corrupt_downloads = mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/bottles/corruptpkg.tar.gz")
+            .count();
+        assert_eq!(corrupt_downloads, super::MAX_CORRUPTION_RETRIES);
+        assert!(
+            !root
+                .join("cache/blobs")
+                .join(format!("{}.tar.gz", sha256_hex(&corrupt_bottle)))
+                .exists(),
+            "the corrupt blob must not be kept"
+        );
     }
 
     #[tokio::test]

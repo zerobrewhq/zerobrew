@@ -16,6 +16,7 @@ pub enum CopyStrategy {
     Copy,
 }
 
+#[derive(Debug, Clone)]
 pub struct Cellar {
     cellar_dir: PathBuf,
 }

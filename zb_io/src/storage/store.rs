@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::extraction::extract::extract_archive;
 use zb_core::Error;
 
+#[derive(Debug, Clone)]
 pub struct Store {
     store_dir: PathBuf,
     locks_dir: PathBuf,

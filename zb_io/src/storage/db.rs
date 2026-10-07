@@ -378,12 +378,13 @@ impl<'a> InstallTransaction<'a> {
         linked_path: &str,
         target_path: &str,
     ) -> Result<(), Error> {
+        // One row per symlink, thousands per keg: keep the statement compiled.
         self.tx
-            .execute(
+            .prepare_cached(
                 "INSERT OR REPLACE INTO keg_files (name, version, linked_path, target_path)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![name, version, linked_path, target_path],
             )
+            .and_then(|mut stmt| stmt.execute(params![name, version, linked_path, target_path]))
             .map_err(Error::store("failed to record linked file"))?;
 
         Ok(())

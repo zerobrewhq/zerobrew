@@ -18,6 +18,7 @@ pub struct DownloadRequest {
 
 type InflightMap = HashMap<String, Arc<tokio::sync::broadcast::Sender<Result<PathBuf, String>>>>;
 
+#[derive(Clone)]
 pub struct ParallelDownloader {
     downloader: Arc<Downloader>,
     semaphore: Arc<Semaphore>,

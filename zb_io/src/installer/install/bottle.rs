@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tracing::warn;
 use zb_core::{Error, InstallMethod, formula_token};
@@ -7,17 +7,20 @@ use zb_core::{Error, InstallMethod, formula_token};
 use crate::cellar::link::Linker;
 use crate::cellar::materialize::Cellar;
 use crate::installer::cask::resolve_cask;
-use crate::network::download::{DownloadProgressCallback, DownloadRequest, DownloadResult};
+use crate::network::download::{DownloadProgressCallback, DownloadRequest, ParallelDownloader};
 use crate::progress::InstallProgress;
+use crate::storage::store::Store;
 
 use super::{Installer, MAX_CORRUPTION_RETRIES, PlannedInstall};
 
 impl Installer {
-    pub(super) async fn process_bottle_item(
+    /// Clone a prepared store entry into the Cellar, record it, and link it.
+    /// Runs on the install task, one bottle at a time, once
+    /// [`prepare_bottle`] has produced the entry.
+    pub(super) fn finish_bottle_item(
         &mut self,
         item: &PlannedInstall,
-        download: &DownloadResult,
-        download_progress: &Option<DownloadProgressCallback>,
+        store_entry: &Path,
         link: bool,
         report: &impl Fn(InstallProgress),
     ) -> Result<(), Error> {
@@ -29,17 +32,9 @@ impl Installer {
         let version = item.formula.effective_version();
         let store_key = &bottle.sha256;
 
-        report(InstallProgress::UnpackStarted {
-            name: formula_name.clone(),
-        });
-
-        let store_entry = self
-            .extract_with_retry(download, &item.formula, bottle, download_progress.clone())
-            .await?;
-
         let keg_path = self
             .cellar
-            .materialize(formula_name, &version, &store_entry)?;
+            .materialize(formula_name, &version, store_entry)?;
 
         // Before recording the install, so a failure doesn't leave the
         // package marked installed without its config files.
@@ -113,82 +108,6 @@ impl Installer {
         });
 
         Ok(())
-    }
-
-    async fn extract_with_retry(
-        &self,
-        download: &DownloadResult,
-        formula: &zb_core::Formula,
-        bottle: &zb_core::SelectedBottle,
-        progress: Option<DownloadProgressCallback>,
-    ) -> Result<std::path::PathBuf, Error> {
-        let mut blob_path = download.blob_path.clone();
-        let mut last_error = None;
-        let version = formula.effective_version();
-        let fingerprint = self.cellar.relocation_fingerprint(bottle.build_prefix());
-
-        for attempt in 0..MAX_CORRUPTION_RETRIES {
-            let relocate = |extracted: &Path| {
-                self.cellar.relocate_extracted(
-                    extracted,
-                    &formula.name,
-                    &version,
-                    bottle.build_prefix(),
-                )
-            };
-            match self
-                .store
-                .ensure_entry(&bottle.sha256, &blob_path, &fingerprint, relocate)
-            {
-                Ok(entry) => return Ok(entry),
-                Err(Error::StoreCorruption { message }) => {
-                    self.downloader.remove_blob(&bottle.sha256);
-
-                    if attempt + 1 < MAX_CORRUPTION_RETRIES {
-                        warn!(
-                            formula = %formula.name,
-                            attempt = attempt + 2,
-                            max_retries = MAX_CORRUPTION_RETRIES,
-                            "corrupted download detected; retrying"
-                        );
-
-                        let request = DownloadRequest {
-                            url: bottle.url.clone(),
-                            sha256: bottle.sha256.clone(),
-                            name: formula.name.clone(),
-                        };
-
-                        match self
-                            .downloader
-                            .download_single(request, progress.clone())
-                            .await
-                        {
-                            Ok(new_path) => {
-                                blob_path = new_path;
-                            }
-                            Err(e) => {
-                                last_error = Some(e);
-                                break;
-                            }
-                        }
-                    } else {
-                        last_error = Some(Error::StoreCorruption {
-                            message: format!(
-                                "{message}\n\nFailed after {MAX_CORRUPTION_RETRIES} attempts. The download may be corrupted at the source."
-                            ),
-                        });
-                    }
-                }
-                Err(e) => {
-                    last_error = Some(e);
-                    break;
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| Error::StoreCorruption {
-            message: "extraction failed with unknown error".to_string(),
-        }))
     }
 
     fn record_linked_files(
@@ -307,6 +226,119 @@ impl Installer {
         cleanup.disarm();
         Ok(())
     }
+}
+
+/// What it takes to turn a downloaded bottle into a store entry.
+#[derive(Debug, Clone)]
+pub(super) struct BottleJob {
+    /// Position in the plan's bottle list.
+    pub(super) index: usize,
+    pub(super) formula_name: String,
+    pub(super) version: String,
+    pub(super) sha256: String,
+    pub(super) url: String,
+    pub(super) build_prefix: String,
+}
+
+impl BottleJob {
+    pub(super) fn new(index: usize, item: &PlannedInstall) -> Self {
+        let InstallMethod::Bottle(ref bottle) = item.method else {
+            unreachable!()
+        };
+        Self {
+            index,
+            formula_name: item.formula.name.clone(),
+            version: item.formula.effective_version(),
+            sha256: bottle.sha256.clone(),
+            url: bottle.url.clone(),
+            build_prefix: bottle.build_prefix().to_string(),
+        }
+    }
+}
+
+/// Unpack and relocate a downloaded bottle into the store. The blocking
+/// work runs off the async runtime, so several bottles can be prepared at
+/// once while others are still downloading. A blob that turns out corrupt
+/// is downloaded again, up to [`MAX_CORRUPTION_RETRIES`] times.
+pub(super) async fn prepare_bottle(
+    store: Store,
+    cellar: Cellar,
+    downloader: ParallelDownloader,
+    job: BottleJob,
+    mut blob_path: PathBuf,
+    progress: Option<DownloadProgressCallback>,
+) -> Result<PathBuf, Error> {
+    let fingerprint = cellar.relocation_fingerprint(&job.build_prefix);
+    let mut last_error = None;
+
+    for attempt in 0..MAX_CORRUPTION_RETRIES {
+        let (store, cellar, job_for_task, fingerprint, blob) = (
+            store.clone(),
+            cellar.clone(),
+            job.clone(),
+            fingerprint.clone(),
+            blob_path.clone(),
+        );
+        let outcome = tokio::task::spawn_blocking(move || {
+            let job = job_for_task;
+            store.ensure_entry(&job.sha256, &blob, &fingerprint, |extracted| {
+                cellar.relocate_extracted(
+                    extracted,
+                    &job.formula_name,
+                    &job.version,
+                    &job.build_prefix,
+                )
+            })
+        })
+        .await
+        .map_err(|e| Error::ExecutionError {
+            message: format!("bottle preparation task failed: {e}"),
+        })?;
+
+        match outcome {
+            Ok(entry) => return Ok(entry),
+            Err(Error::StoreCorruption { message }) => {
+                downloader.remove_blob(&job.sha256);
+
+                if attempt + 1 < MAX_CORRUPTION_RETRIES {
+                    warn!(
+                        formula = %job.formula_name,
+                        attempt = attempt + 2,
+                        max_retries = MAX_CORRUPTION_RETRIES,
+                        "corrupted download detected; retrying"
+                    );
+
+                    let request = DownloadRequest {
+                        url: job.url.clone(),
+                        sha256: job.sha256.clone(),
+                        name: job.formula_name.clone(),
+                    };
+
+                    match downloader.download_single(request, progress.clone()).await {
+                        Ok(new_path) => blob_path = new_path,
+                        Err(e) => {
+                            last_error = Some(e);
+                            break;
+                        }
+                    }
+                } else {
+                    last_error = Some(Error::StoreCorruption {
+                        message: format!(
+                            "{message}\n\nFailed after {MAX_CORRUPTION_RETRIES} attempts. The download may be corrupted at the source."
+                        ),
+                    });
+                }
+            }
+            Err(e) => {
+                last_error = Some(e);
+                break;
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| Error::StoreCorruption {
+        message: "extraction failed with unknown error".to_string(),
+    }))
 }
 
 pub(super) fn dependency_cellar_path(
