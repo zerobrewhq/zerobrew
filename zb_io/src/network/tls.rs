@@ -39,14 +39,18 @@ fn build_rustls_config() -> rustls::ClientConfig {
 
     let root_store = assemble_root_store(cert_result.certs);
 
-    rustls::ClientConfig::builder_with_provider(provider.into())
+    let mut config = rustls::ClientConfig::builder_with_provider(provider.into())
         .with_safe_default_protocol_versions()
         // The aws-lc-rs provider always supports TLS 1.2/1.3, so this is unreachable.
         // Panicking here (instead of returning None) avoids silently dropping back to
         // reqwest's system-root TLS, which would reintroduce the sandbox CA-cert panic.
         .expect("aws-lc-rs provider supports TLS 1.2 and 1.3")
         .with_root_certificates(root_store)
-        .with_no_client_auth()
+        .with_no_client_auth();
+    // reqwest only negotiates HTTP/2 when the TLS config it is handed offers
+    // it; without this every connection is HTTP/1.1 and nothing multiplexes.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config
 }
 
 /// Assemble a trust store from the system's native certs, falling back to the
