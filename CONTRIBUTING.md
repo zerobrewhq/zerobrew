@@ -11,18 +11,6 @@ By contributing to zerobrew, you agree your contributions will be dual-licensed 
 - Rust 1.90 or later
 - Access to either a macOS or Linux machine
 
-## A note on LLM usage
-While we encourage the use of LLM's for thinking through problems, helping with tests, and even writing code, we simply 
-cannot accept or tolerate PRs with no clear guidance or thought put into them.
-
-**_Please understand_** that we reserve the right to simply close your PR if it exhibits clear indicators 
-of heavy LLM usage. We understand you are excited to contribute but the code must reach a level of quality
-that's typically achieved through thoughtful engagement in the community and the issues/agenda of zerobrew- NOT
-by throwing a prompt into an LLM and opening a PR with no direction.
-
-If you ever need help or want to walk through an issue or idea that you have with one of the maintainers, feel free to join 
-the [community discord](https://discord.gg/TVatsQBFJt); we would be more than happy to assist you.
-
 ## Project Structure
 
 zerobrew is organized as a Cargo workspace with three crates:
