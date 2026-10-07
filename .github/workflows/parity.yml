@@ -1,7 +1,13 @@
-# Installs the same formulae with Homebrew and with zb on the same runner and
-# compares what landed on disk. Homebrew is the reference, so a failure here
-# means zb wrote something Homebrew would not have, or Homebrew changed.
-# See https://github.com/zerobrewhq/zerobrew/issues/421.
+# Installs the same formulae with Homebrew and with zb on the same runner.
+#
+# parity: compares what landed on disk. Homebrew is the reference, so a
+# failure here means zb wrote something Homebrew would not have, or Homebrew
+# changed. See https://github.com/zerobrewhq/zerobrew/issues/421.
+#
+# timing: installs every case cold with both tools and compares wall-clock
+# time. Its own job, so nothing is cached for either tool. Nightly runs fail
+# when zb is not at least ZB_TIMING_MIN_SPEEDUP times faster; pull requests
+# only report. See https://github.com/zerobrewhq/zerobrew/issues/422.
 name: parity
 
 on:
@@ -59,4 +65,34 @@ jobs:
           ZB_PARITY_REQUIRE_BREW: "1"
         # One at a time: the tests share the runner's Homebrew, and brew takes
         # a lock per install.
-        run: cargo test --package zb_cli --features parity --test parity -- --nocapture --test-threads=1
+        run: cargo test --package zb_cli --features parity --test parity -- --nocapture --test-threads=1 --skip install_timings
+
+  timing:
+    name: timing / macos-arm64 / rust ${{ matrix.rust }}
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        rust: ["1.96"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: cache rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-latest-${{ matrix.rust }}-release
+
+      - name: homebrew version
+        run: brew --version
+
+      # Release build: a debug zb is several times slower and would measure
+      # the compiler, not the tool.
+      - name: time installs
+        env:
+          ZB_PARITY_REQUIRE_BREW: "1"
+          ZB_TIMING_MIN_SPEEDUP: ${{ github.event_name == 'schedule' && '1.5' || '' }}
+        run: cargo test --release --package zb_cli --features parity --test parity -- --nocapture install_timings

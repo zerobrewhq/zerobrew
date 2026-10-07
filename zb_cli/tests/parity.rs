@@ -11,16 +11,20 @@
 //!
 //!     cargo test -p zb_cli --features parity --test parity -- --test-threads=1
 //!
-//! A plain `cargo test --workspace` leaves them out.
+//! A plain `cargo test --workspace` leaves them out. `install_timings` compares
+//! install times instead of files; CI runs it in a separate job on a fresh
+//! runner with a release build, see `.github/workflows/parity.yml`.
 //!
 //! macOS only for now: binaries are compared through `otool` and `codesign`.
 #![cfg(target_os = "macos")]
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 /// Files Homebrew writes into a keg that zerobrew doesn't, or writes differently.
 /// Each entry says why.
@@ -608,4 +612,151 @@ fn links_match_homebrew() {
         }
     }
     assert_no_differences("links", &all_diffs);
+}
+
+/// How much faster than Homebrew `zb install` has to be, per case, as a
+/// ratio of wall-clock seconds. Read from `ZB_TIMING_MIN_SPEEDUP`; unset
+/// means report only. Hosted runners vary too much run to run for absolute
+/// times to mean anything, so only the ratio measured in one run is gated.
+fn min_speedup() -> Option<f64> {
+    let raw = std::env::var("ZB_TIMING_MIN_SPEEDUP").ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(
+        raw.trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("ZB_TIMING_MIN_SPEEDUP={raw:?} is not a number: {e}")),
+    )
+}
+
+struct Timing {
+    formula: &'static str,
+    brew: Duration,
+    zb: Duration,
+}
+
+impl Timing {
+    fn speedup(&self) -> f64 {
+        self.brew.as_secs_f64() / self.zb.as_secs_f64()
+    }
+}
+
+/// Make Homebrew forget `case` so its install downloads and pours like a
+/// first install: remove the kegs the runner may ship preinstalled and the
+/// bottles in its download cache.
+fn make_brew_cold(brew: &Brew, case: &Case) {
+    let installed: Vec<&str> = case
+        .kegs
+        .iter()
+        .copied()
+        .filter(|keg| {
+            brew.run(&["list", "--formula", "--versions", keg])
+                .status
+                .success()
+        })
+        .collect();
+    if !installed.is_empty() {
+        let mut args = vec!["uninstall", "--formula", "--ignore-dependencies", "--force"];
+        args.extend(installed);
+        assert_success(&brew.run(&args), "brew uninstall");
+    }
+    let cache = PathBuf::from(stdout(&brew.run(&["--cache"]), "brew --cache")).join("downloads");
+    if let Ok(entries) = fs::read_dir(&cache) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Download names look like `<sha>--<formula>--<version>.<tag>.bottle.tar.gz`
+            // and `<sha>--<formula>-<version>.bottle_manifest.json`.
+            if case
+                .kegs
+                .iter()
+                .any(|keg| name.contains(&format!("--{keg}-")))
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+fn timed<T>(f: impl FnOnce() -> T) -> (T, Duration) {
+    let start = Instant::now();
+    let value = f();
+    (value, start.elapsed())
+}
+
+fn timing_table(timings: &[Timing]) -> String {
+    let mut table =
+        String::from("| formula | homebrew | zerobrew | speedup |\n|---|---:|---:|---:|\n");
+    for t in timings {
+        table.push_str(&format!(
+            "| {} | {:.2}s | {:.2}s | {:.1}x |\n",
+            t.formula,
+            t.brew.as_secs_f64(),
+            t.zb.as_secs_f64(),
+            t.speedup()
+        ));
+    }
+    table
+}
+
+/// Install every case cold with both tools and compare wall-clock time.
+///
+/// Runs in its own CI job on a fresh runner, so nothing is cached for either
+/// tool. `brew update` runs once beforehand and is not timed: zb has no
+/// equivalent step, and the API refresh is the part of `brew install` that
+/// depends most on the network. See
+/// https://github.com/zerobrewhq/zerobrew/issues/422
+#[test]
+fn install_timings() {
+    let Some(brew) = Brew::find() else {
+        return;
+    };
+    if std::env::var_os("ZB_PARITY_BREW").is_none() {
+        assert_success(&brew.run(&["update", "--quiet"]), "brew update");
+    }
+
+    let mut timings = Vec::new();
+    for case in CASES {
+        if case.needs_default_prefix && brew.prefix != Path::new("/opt/homebrew") {
+            continue;
+        }
+        make_brew_cold(&brew, case);
+        let (_, brew_time) = timed(|| {
+            assert_success(
+                &brew.run(&["install", "--formula", case.formula]),
+                &format!("brew install {}", case.formula),
+            )
+        });
+        let zb = Zb::new();
+        let (_, zb_time) = timed(|| zb.install(case.formula));
+        timings.push(Timing {
+            formula: case.formula,
+            brew: brew_time,
+            zb: zb_time,
+        });
+    }
+
+    let table = timing_table(&timings);
+    eprintln!("\n{table}");
+    if let Some(summary) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(summary)
+            .expect("cannot open GITHUB_STEP_SUMMARY");
+        writeln!(file, "### install timings, cold\n\n{table}").expect("cannot write summary");
+    }
+
+    if let Some(min) = min_speedup() {
+        let slow: Vec<String> = timings
+            .iter()
+            .filter(|t| t.speedup() < min)
+            .map(|t| format!("{}: {:.1}x (need {min}x)", t.formula, t.speedup()))
+            .collect();
+        assert!(
+            slow.is_empty(),
+            "zb install is not {min}x faster than Homebrew for:\n{}",
+            slow.join("\n")
+        );
+    }
 }
