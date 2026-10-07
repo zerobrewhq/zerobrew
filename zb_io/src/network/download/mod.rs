@@ -2,6 +2,7 @@ mod auth;
 mod parallel;
 mod single;
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -45,6 +46,28 @@ impl DownloadError {
     }
 }
 
+/// Publish what a [`BodyConsumer`] produced. Runs once the checksum matched.
+pub type Commit = Box<dyn FnOnce() -> Result<(), Error> + Send>;
+
+/// Read a download's body to its end and return how to publish the result.
+pub type Consume = Box<dyn FnOnce(&mut dyn Read) -> Result<Commit, Error> + Send>;
+
+/// Work done on a download's body as it arrives, alongside writing the blob:
+/// unpacking a bottle while it is still in flight. `consume` runs on a
+/// blocking thread and reads the body to its end; the commit it returns is
+/// run only once the checksum matched, and dropped otherwise. A consumer
+/// that fails does not fail the download: the blob is still there to be
+/// unpacked the usual way.
+pub struct BodyConsumer {
+    pub consume: Consume,
+}
+
+impl std::fmt::Debug for BodyConsumer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BodyConsumer")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DownloadResult {
     pub name: String,
@@ -54,4 +77,5 @@ pub struct DownloadResult {
 }
 
 pub use parallel::{DownloadRequest, ParallelDownloader};
+
 pub use single::Downloader;

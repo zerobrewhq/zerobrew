@@ -7,7 +7,9 @@ use zb_core::{Error, InstallMethod, formula_token};
 use crate::cellar::link::Linker;
 use crate::cellar::materialize::Cellar;
 use crate::installer::cask::resolve_cask;
-use crate::network::download::{DownloadProgressCallback, DownloadRequest, ParallelDownloader};
+use crate::network::download::{
+    BodyConsumer, Commit, DownloadProgressCallback, DownloadRequest, ParallelDownloader,
+};
 use crate::progress::InstallProgress;
 use crate::storage::store::Store;
 
@@ -176,11 +178,11 @@ impl Installer {
         let blob_path = self
             .downloader
             .download_single(
-                DownloadRequest {
-                    url: cask.url.clone(),
-                    sha256: cask.sha256.clone(),
-                    name: cask.install_name.clone(),
-                },
+                DownloadRequest::new(
+                    cask.url.clone(),
+                    cask.sha256.clone(),
+                    cask.install_name.clone(),
+                ),
                 None,
             )
             .await?;
@@ -256,6 +258,29 @@ impl BottleJob {
     }
 }
 
+/// Unpack and relocate a bottle while it downloads. The entry is published
+/// by the downloader once the checksum matched, so [`prepare_bottle`] then
+/// finds it ready; if anything goes wrong here the blob is unpacked the
+/// usual way instead.
+pub(super) fn stream_into_store(store: &Store, cellar: &Cellar, job: BottleJob) -> BodyConsumer {
+    let store = store.clone();
+    let cellar = cellar.clone();
+    BodyConsumer {
+        consume: Box::new(move |body| {
+            let fingerprint = cellar.relocation_fingerprint(&job.build_prefix);
+            let staged = store.stage_entry(&job.sha256, body, &fingerprint, |extracted| {
+                cellar.relocate_extracted(
+                    extracted,
+                    &job.formula_name,
+                    &job.version,
+                    &job.build_prefix,
+                )
+            })?;
+            Ok(Box::new(move || staged.commit().map(|_| ())) as Commit)
+        }),
+    }
+}
+
 /// Unpack and relocate a downloaded bottle into the store. The blocking
 /// work runs off the async runtime, so several bottles can be prepared at
 /// once while others are still downloading. A blob that turns out corrupt
@@ -308,11 +333,11 @@ pub(super) async fn prepare_bottle(
                         "corrupted download detected; retrying"
                     );
 
-                    let request = DownloadRequest {
-                        url: job.url.clone(),
-                        sha256: job.sha256.clone(),
-                        name: job.formula_name.clone(),
-                    };
+                    let request = DownloadRequest::new(
+                        job.url.clone(),
+                        job.sha256.clone(),
+                        job.formula_name.clone(),
+                    );
 
                     match downloader.download_single(request, progress.clone()).await {
                         Ok(new_path) => blob_path = new_path,

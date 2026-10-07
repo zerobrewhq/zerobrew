@@ -1,14 +1,16 @@
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::header::CONTENT_LENGTH;
 use sha2::{Digest, Sha256};
-use tokio::sync::RwLock;
-use tracing::warn;
+use tokio::sync::{RwLock, mpsc};
+use tokio::task::JoinHandle;
+use tracing::{debug, warn};
 
 use crate::network::tls::shared_tls_config;
 use crate::progress::InstallProgress;
@@ -17,7 +19,8 @@ use zb_core::Error;
 
 use super::auth::{TokenCache, TokenEndpoint, fetch_download_response_internal, prefetch_tokens};
 use super::{
-    DownloadError, DownloadProgressCallback, GLOBAL_DOWNLOAD_CONCURRENCY, MAX_DOWNLOAD_ATTEMPTS,
+    BodyConsumer, Commit, DownloadError, DownloadProgressCallback, GLOBAL_DOWNLOAD_CONCURRENCY,
+    MAX_DOWNLOAD_ATTEMPTS,
 };
 
 fn get_alternate_urls(primary_url: &str) -> Vec<String> {
@@ -99,7 +102,7 @@ impl Downloader {
     }
 
     pub async fn download(&self, url: &str, expected_sha256: &str) -> Result<PathBuf, Error> {
-        self.download_with_progress(url, expected_sha256, None, None)
+        self.download_with_progress(url, expected_sha256, None, None, None)
             .await
     }
 
@@ -109,6 +112,7 @@ impl Downloader {
         expected_sha256: &str,
         name: Option<String>,
         progress: Option<DownloadProgressCallback>,
+        consumer: Option<BodyConsumer>,
     ) -> Result<PathBuf, Error> {
         if self.blob_cache.has_blob(expected_sha256) {
             if let (Some(cb), Some(n)) = (&progress, &name) {
@@ -122,26 +126,34 @@ impl Downloader {
 
         let mut urls = vec![url.to_string()];
         urls.extend(get_alternate_urls(url));
-        self.download_from(&urls, expected_sha256, name, progress)
+        self.download_from(&urls, expected_sha256, name, progress, consumer)
             .await
     }
 
     /// Download from the first of `urls` that works. Each URL gets up to
     /// [`MAX_DOWNLOAD_ATTEMPTS`] tries with backoff while its failures look
-    /// transient; a final failure moves on to the next URL.
+    /// transient; a final failure moves on to the next URL. The consumer, if
+    /// any, sees the first attempt only.
     async fn download_from(
         &self,
         urls: &[String],
         expected_sha256: &str,
         name: Option<String>,
         progress: Option<DownloadProgressCallback>,
+        mut consumer: Option<BodyConsumer>,
     ) -> Result<PathBuf, Error> {
         let mut last_error = None;
 
         for url in urls {
             for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
                 match self
-                    .download_once(url, expected_sha256, name.clone(), progress.clone())
+                    .download_once(
+                        url,
+                        expected_sha256,
+                        name.clone(),
+                        progress.clone(),
+                        consumer.take(),
+                    )
                     .await
                 {
                     Ok(path) => return Ok(path),
@@ -175,21 +187,112 @@ impl Downloader {
         expected_sha256: &str,
         name: Option<String>,
         progress: Option<DownloadProgressCallback>,
+        consumer: Option<BodyConsumer>,
     ) -> Result<PathBuf, DownloadError> {
         let response =
             fetch_download_response_internal(&self.client, &self.token_cache, url).await?;
-        download_response_internal(&self.blob_cache, response, expected_sha256, name, progress)
-            .await
+        download_response_internal(
+            &self.blob_cache,
+            response,
+            expected_sha256,
+            name,
+            progress,
+            consumer,
+        )
+        .await
     }
 }
 
-/// Stream a response into the blob cache, verifying its checksum.
+/// How many body chunks may wait for a slow consumer before the download
+/// pauses for it.
+const CONSUMER_BACKLOG: usize = 32;
+
+/// A [`BodyConsumer`] running on a blocking thread, fed chunk by chunk.
+struct Tee {
+    sender: Option<mpsc::Sender<Bytes>>,
+    consumer: JoinHandle<Result<Commit, Error>>,
+}
+
+impl Tee {
+    fn start(consumer: BodyConsumer) -> Self {
+        let (sender, receiver) = mpsc::channel(CONSUMER_BACKLOG);
+        let consumer = tokio::task::spawn_blocking(move || {
+            let mut body = ChannelReader {
+                receiver,
+                current: Bytes::new(),
+            };
+            (consumer.consume)(&mut body)
+        });
+        Self {
+            sender: Some(sender),
+            consumer,
+        }
+    }
+
+    /// Hand a chunk to the consumer. A consumer that has given up is left
+    /// alone; the download itself goes on.
+    async fn feed(&mut self, chunk: &Bytes) {
+        if let Some(sender) = &self.sender
+            && sender.send(chunk.clone()).await.is_err()
+        {
+            self.sender = None;
+        }
+    }
+
+    /// Signal the end of the body, wait for the consumer and run its commit.
+    async fn finish(mut self, name: &str) {
+        self.sender = None;
+        let commit = match self.consumer.await {
+            Ok(Ok(commit)) => commit,
+            Ok(Err(e)) => {
+                debug!(name, error = %e, "could not unpack while downloading; unpacking the blob instead");
+                return;
+            }
+            Err(e) => {
+                warn!(name, error = %e, "unpack task failed; unpacking the blob instead");
+                return;
+            }
+        };
+        match tokio::task::spawn_blocking(commit).await {
+            Ok(Ok(())) => debug!(name, "unpacked while downloading"),
+            Ok(Err(e)) => {
+                debug!(name, error = %e, "could not publish the streamed unpack; unpacking the blob instead")
+            }
+            Err(e) => warn!(name, error = %e, "commit task failed; unpacking the blob instead"),
+        }
+    }
+}
+
+/// The body as a blocking `Read`, for the consumer thread.
+struct ChannelReader {
+    receiver: mpsc::Receiver<Bytes>,
+    current: Bytes,
+}
+
+impl Read for ChannelReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.current.is_empty() {
+            match self.receiver.blocking_recv() {
+                Some(chunk) => self.current = chunk,
+                None => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.current.len());
+        buf[..n].copy_from_slice(&self.current[..n]);
+        self.current = self.current.slice(n..);
+        Ok(n)
+    }
+}
+
+/// Stream a response into the blob cache, verifying its checksum, and
+/// through the consumer if there is one.
 async fn download_response_internal(
     blob_cache: &BlobCache,
     response: reqwest::Response,
     expected_sha256: &str,
     name: Option<String>,
     progress: Option<DownloadProgressCallback>,
+    consumer: Option<BodyConsumer>,
 ) -> Result<PathBuf, DownloadError> {
     let total_bytes = response
         .headers()
@@ -211,6 +314,7 @@ async fn download_response_internal(
     let mut hasher = Sha256::new();
     let mut stream = response.bytes_stream();
     let mut downloaded: u64 = 0;
+    let mut tee = consumer.map(Tee::start);
 
     while let Some(chunk) = stream.next().await {
         // A connection dropped mid-body; the next attempt starts over.
@@ -222,6 +326,9 @@ async fn download_response_internal(
         writer
             .write_all(&chunk)
             .map_err(|e| DownloadError::permanent(Error::network("failed to write chunk")(e)))?;
+        if let Some(tee) = &mut tee {
+            tee.feed(&chunk).await;
+        }
 
         if let (Some(cb), Some(n)) = (&progress, &name) {
             cb(InstallProgress::DownloadProgress {
@@ -236,7 +343,7 @@ async fn download_response_internal(
 
     if actual_hash != expected_sha256 {
         // Most often a truncated or mangled transfer; the next attempt may
-        // get the real thing.
+        // get the real thing. Whatever the consumer made of it is dropped.
         return Err(DownloadError::transient(Error::ChecksumMismatch {
             expected: expected_sha256.to_string(),
             actual: actual_hash,
@@ -254,7 +361,11 @@ async fn download_response_internal(
         });
     }
 
-    writer.commit().map_err(DownloadError::permanent)
+    let blob = writer.commit().map_err(DownloadError::permanent)?;
+    if let Some(tee) = tee {
+        tee.finish(name.as_deref().unwrap_or(expected_sha256)).await;
+    }
+    Ok(blob)
 }
 
 #[cfg(test)]
@@ -427,11 +538,140 @@ mod tests {
             format!("{}/x.tar.gz", mirror.uri()),
         ];
         let path = downloader(&tmp)
-            .download_from(&urls, HELLO_SHA, None, None)
+            .download_from(&urls, HELLO_SHA, None, None, None)
             .await
             .unwrap();
 
         assert_eq!(std::fs::read(path).unwrap(), b"hello world");
+    }
+
+    /// A consumer that collects the body and records whether its commit ran.
+    fn recording_consumer() -> (
+        BodyConsumer,
+        Arc<std::sync::Mutex<Vec<u8>>>,
+        Arc<AtomicUsize>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let committed = Arc::new(AtomicUsize::new(0));
+        let (seen_in, committed_in) = (seen.clone(), committed.clone());
+        let consumer = BodyConsumer {
+            consume: Box::new(move |body| {
+                let mut bytes = Vec::new();
+                body.read_to_end(&mut bytes)
+                    .map_err(Error::store("read body"))?;
+                *seen_in.lock().unwrap() = bytes;
+                Ok(Box::new(move || {
+                    committed_in.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }) as Commit)
+            }),
+        };
+        (consumer, seen, committed)
+    }
+
+    #[tokio::test]
+    async fn the_consumer_sees_the_whole_body_and_commits_after_the_checksum() {
+        let mock_server = MockServer::start().await;
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let sha = {
+            let mut h = Sha256::new();
+            h.update(&body);
+            crate::checksum::sha256_hex(h)
+        };
+        Mock::given(method("GET"))
+            .and(path("/big.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&mock_server)
+            .await;
+        let (consumer, seen, committed) = recording_consumer();
+
+        let tmp = TempDir::new().unwrap();
+        let url = format!("{}/big.tar.gz", mock_server.uri());
+        let blob = downloader(&tmp)
+            .download_with_progress(&url, &sha, None, None, Some(consumer))
+            .await
+            .unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), body);
+        assert_eq!(committed.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(blob).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn a_checksum_mismatch_never_commits_the_consumer() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/wrong.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello world".to_vec()))
+            .mount(&mock_server)
+            .await;
+        let (consumer, seen, committed) = recording_consumer();
+        let wrong = "0".repeat(64);
+
+        let tmp = TempDir::new().unwrap();
+        let url = format!("{}/wrong.tar.gz", mock_server.uri());
+        let err = downloader(&tmp)
+            .download_with_progress(&url, &wrong, None, None, Some(consumer))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::ChecksumMismatch { .. }));
+        assert_eq!(*seen.lock().unwrap(), b"hello world", "the consumer ran");
+        assert_eq!(committed.load(Ordering::SeqCst), 0, "but was not committed");
+    }
+
+    #[tokio::test]
+    async fn a_failing_consumer_does_not_fail_the_download() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/test.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello world".to_vec()))
+            .mount(&mock_server)
+            .await;
+        let consumer = BodyConsumer {
+            consume: Box::new(|body| {
+                // Give up after the first bytes, like a corrupt archive would.
+                let mut first = [0u8; 4];
+                body.read_exact(&mut first)
+                    .map_err(Error::store("read body"))?;
+                Err(Error::StoreCorruption {
+                    message: "not an archive".into(),
+                })
+            }),
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let url = format!("{}/test.tar.gz", mock_server.uri());
+        let blob = downloader(&tmp)
+            .download_with_progress(&url, HELLO_SHA, None, None, Some(consumer))
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(blob).unwrap(), b"hello world");
+    }
+
+    #[tokio::test]
+    async fn a_cached_blob_skips_the_consumer() {
+        let tmp = TempDir::new().unwrap();
+        let blob_cache = BlobCache::new(tmp.path()).unwrap();
+        let mut writer = blob_cache.start_write(HELLO_SHA).unwrap();
+        writer.write_all(b"hello world").unwrap();
+        writer.commit().unwrap();
+        let (consumer, seen, committed) = recording_consumer();
+
+        Downloader::new(blob_cache)
+            .download_with_progress(
+                "http://127.0.0.1:9/unused",
+                HELLO_SHA,
+                None,
+                None,
+                Some(consumer),
+            )
+            .await
+            .unwrap();
+
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(committed.load(Ordering::SeqCst), 0);
     }
 
     /// A registry that demands a token: anonymous requests get a challenge.

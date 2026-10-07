@@ -26,7 +26,7 @@ use crate::storage::store::Store;
 
 use zb_core::{ConcurrencyLimits, Error, Formula, InstallMethod};
 
-use bottle::{BottleJob, dependency_cellar_path, prepare_bottle};
+use bottle::{BottleJob, dependency_cellar_path, prepare_bottle, stream_into_store};
 
 const MAX_CORRUPTION_RETRIES: usize = 3;
 
@@ -169,15 +169,15 @@ impl Installer {
         if !bottle_items.is_empty() {
             let requests: Vec<DownloadRequest> = bottle_items
                 .iter()
-                .map(|item| {
-                    let InstallMethod::Bottle(ref bottle) = item.method else {
-                        unreachable!()
-                    };
-                    DownloadRequest {
-                        url: bottle.url.clone(),
-                        sha256: bottle.sha256.clone(),
-                        name: item.formula.name.clone(),
-                    }
+                .enumerate()
+                .map(|(index, item)| {
+                    let job = BottleJob::new(index, item);
+                    let request = DownloadRequest::new(
+                        job.url.clone(),
+                        job.sha256.clone(),
+                        job.formula_name.clone(),
+                    );
+                    request.with_consumer(stream_into_store(&self.store, &self.cellar, job))
                 })
                 .collect();
 

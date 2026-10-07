@@ -69,11 +69,11 @@ impl Installer {
             .items
             .iter()
             .filter_map(|item| match &item.method {
-                InstallMethod::Bottle(bottle) => Some(DownloadRequest {
-                    url: bottle.url.clone(),
-                    sha256: bottle.sha256.clone(),
-                    name: item.formula.name.clone(),
-                }),
+                InstallMethod::Bottle(bottle) => Some(DownloadRequest::new(
+                    bottle.url.clone(),
+                    bottle.sha256.clone(),
+                    item.formula.name.clone(),
+                )),
                 _ => None,
             })
             .collect();

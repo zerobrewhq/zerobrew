@@ -8,12 +8,30 @@ use crate::storage::blob::BlobCache;
 use zb_core::Error;
 
 use super::single::Downloader;
-use super::{DownloadProgressCallback, DownloadResult, GLOBAL_DOWNLOAD_CONCURRENCY};
+use super::{BodyConsumer, DownloadProgressCallback, DownloadResult, GLOBAL_DOWNLOAD_CONCURRENCY};
 
 pub struct DownloadRequest {
     pub url: String,
     pub sha256: String,
     pub name: String,
+    /// Work to do on the body as it streams in; see [`BodyConsumer`].
+    pub consumer: Option<BodyConsumer>,
+}
+
+impl DownloadRequest {
+    pub fn new(url: impl Into<String>, sha256: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            sha256: sha256.into(),
+            name: name.into(),
+            consumer: None,
+        }
+    }
+
+    pub fn with_consumer(mut self, consumer: BodyConsumer) -> Self {
+        self.consumer = Some(consumer);
+        self
+    }
 }
 
 type InflightMap = HashMap<String, Arc<tokio::sync::broadcast::Sender<Result<PathBuf, String>>>>;
@@ -181,7 +199,13 @@ impl ParallelDownloader {
             .map_err(Error::network("semaphore error"))?;
 
         let result = downloader
-            .download_with_progress(&req.url, &req.sha256, Some(req.name), progress)
+            .download_with_progress(
+                &req.url,
+                &req.sha256,
+                Some(req.name),
+                progress,
+                req.consumer,
+            )
             .await;
 
         {
@@ -245,11 +269,11 @@ mod tests {
         let requests: Vec<_> = (0..5)
             .map(|i| {
                 let sha256 = format!("{:064x}", i);
-                DownloadRequest {
-                    url: format!("{}/file{i}.tar.gz", mock_server.uri()),
+                DownloadRequest::new(
+                    format!("{}/file{i}.tar.gz", mock_server.uri()),
                     sha256,
-                    name: format!("pkg{i}"),
-                }
+                    format!("pkg{i}"),
+                )
             })
             .collect();
 
@@ -289,10 +313,12 @@ mod tests {
         let downloader = ParallelDownloader::new(blob_cache);
 
         let requests: Vec<_> = (0..5)
-            .map(|i| DownloadRequest {
-                url: format!("{}/dedup.tar.gz", mock_server.uri()),
-                sha256: actual_sha256.clone(),
-                name: format!("dedup{i}"),
+            .map(|i| {
+                DownloadRequest::new(
+                    format!("{}/dedup.tar.gz", mock_server.uri()),
+                    actual_sha256.clone(),
+                    format!("dedup{i}"),
+                )
             })
             .collect();
 

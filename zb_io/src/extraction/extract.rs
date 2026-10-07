@@ -19,42 +19,46 @@ enum CompressionFormat {
 }
 
 pub fn is_archive(path: &Path) -> Result<bool, Error> {
-    detect_compression(path).map(|fmt| !matches!(fmt, CompressionFormat::Unknown))
-}
-
-fn detect_compression(path: &Path) -> Result<CompressionFormat, Error> {
     let mut file = File::open(path).map_err(Error::store("failed to open tarball"))?;
-
-    let mut magic = [0u8; 6];
+    let mut magic = [0u8; MAGIC_LEN];
     let bytes_read = file
         .read(&mut magic)
         .map_err(Error::store("failed to read magic bytes"))?;
+    Ok(!matches!(
+        detect_compression(&magic[..bytes_read]),
+        CompressionFormat::Unknown
+    ))
+}
 
-    if bytes_read < 2 {
-        return Ok(CompressionFormat::Unknown);
+/// Bytes needed to tell the supported formats apart.
+const MAGIC_LEN: usize = 6;
+
+fn detect_compression(magic: &[u8]) -> CompressionFormat {
+    if magic.len() < 2 {
+        return CompressionFormat::Unknown;
     }
 
     // Gzip: 1f 8b
     if magic[0] == 0x1f && magic[1] == 0x8b {
-        return Ok(CompressionFormat::Gzip);
+        return CompressionFormat::Gzip;
     }
 
     // XZ: fd 37 7a 58 5a 00 (FD 7zXZ\0)
-    if bytes_read >= 6 && magic[0..6] == [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00] {
-        return Ok(CompressionFormat::Xz);
+    if magic.len() >= 6 && magic[0..6] == [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00] {
+        return CompressionFormat::Xz;
     }
 
     // Zstd: 28 b5 2f fd
-    if bytes_read >= 4 && magic[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
-        return Ok(CompressionFormat::Zstd);
+    if magic.len() >= 4 && magic[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+        return CompressionFormat::Zstd;
     }
 
     // ZIP: 50 4b 03 04
-    if bytes_read >= 4 && magic[0..4] == [0x50, 0x4b, 0x03, 0x04] {
-        return Ok(CompressionFormat::Zip);
+    if magic.len() >= 4 && magic[0..4] == [0x50, 0x4b, 0x03, 0x04] {
+        return CompressionFormat::Zip;
     }
 
-    Ok(CompressionFormat::Unknown)
+    CompressionFormat::Unknown
 }
 
 pub fn extract_tarball(tarball_path: &Path, dest_dir: &Path) -> Result<(), Error> {
@@ -62,32 +66,60 @@ pub fn extract_tarball(tarball_path: &Path, dest_dir: &Path) -> Result<(), Error
 }
 
 pub fn extract_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), Error> {
-    let format = detect_compression(archive_path)?;
-
     let file = File::open(archive_path).map_err(Error::store("failed to open archive"))?;
-    let reader = BufReader::new(file);
+    match extract_archive_from_reader(BufReader::new(file), dest_dir)? {
+        Extracted::Done => Ok(()),
+        // Zip archives keep their directory at the end, so they are read
+        // from the file, not the stream.
+        Extracted::NeedsSeek => extract_zip_archive(archive_path, dest_dir),
+    }
+}
+
+/// What [`extract_archive_from_reader`] did with the stream.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Extracted {
+    Done,
+    /// A format that cannot be unpacked from a stream; the caller has to
+    /// go back to the file.
+    NeedsSeek,
+}
+
+/// Unpack a compressed tarball as it is read, detecting the compression
+/// from its first bytes. Used to unpack a bottle while it is still
+/// downloading.
+pub fn extract_archive_from_reader<R: Read>(
+    mut reader: R,
+    dest_dir: &Path,
+) -> Result<Extracted, Error> {
+    let mut magic = [0u8; MAGIC_LEN];
+    let mut filled = 0;
+    while filled < MAGIC_LEN {
+        let n = reader
+            .read(&mut magic[filled..])
+            .map_err(Error::store("failed to read magic bytes"))?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    let format = detect_compression(&magic[..filled]);
+    let reader = std::io::Cursor::new(magic[..filled].to_vec()).chain(reader);
 
     match format {
-        CompressionFormat::Gzip => {
-            let decoder = GzDecoder::new(reader);
-            extract_tar_archive(decoder, dest_dir)
-        }
-        CompressionFormat::Xz => {
-            let decoder = XzDecoder::new(reader);
-            extract_tar_archive(decoder, dest_dir)
-        }
+        CompressionFormat::Gzip => extract_tar_archive(GzDecoder::new(reader), dest_dir)?,
+        CompressionFormat::Xz => extract_tar_archive(XzDecoder::new(reader), dest_dir)?,
         CompressionFormat::Zstd => {
             let decoder =
                 ZstdDecoder::new(reader).map_err(Error::store("failed to create zstd decoder"))?;
-            extract_tar_archive(decoder, dest_dir)
+            extract_tar_archive(decoder, dest_dir)?
         }
-        CompressionFormat::Zip => extract_zip_archive(archive_path, dest_dir),
+        CompressionFormat::Zip => return Ok(Extracted::NeedsSeek),
         CompressionFormat::Unknown => {
             // Try gzip as fallback
-            let decoder = GzDecoder::new(reader);
-            extract_tar_archive(decoder, dest_dir)
+            extract_tar_archive(GzDecoder::new(reader), dest_dir)?
         }
     }
+    Ok(Extracted::Done)
 }
 
 fn extract_tar_archive<R: Read>(reader: R, dest_dir: &Path) -> Result<(), Error> {
@@ -276,6 +308,71 @@ fn normalize_path(path: &Path) -> PathBuf {
 pub fn extract_tarball_from_reader<R: Read>(reader: R, dest_dir: &Path) -> Result<(), Error> {
     let decoder = GzDecoder::new(reader);
     extract_tar_archive(decoder, dest_dir)
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    fn gz_tarball() -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("pkg/1.0/bin/tool").unwrap();
+        header.set_size(5);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder.append(&header, &b"hello"[..]).unwrap();
+        let tar = builder.into_inner().unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn unpacks_a_gzip_stream_without_seeking() {
+        let tmp = TempDir::new().unwrap();
+        // A reader that hands out one byte at a time, like a slow network.
+        struct Trickle(std::io::Cursor<Vec<u8>>);
+        impl Read for Trickle {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let len = buf.len().min(1);
+                self.0.read(&mut buf[..len])
+            }
+        }
+
+        let done =
+            extract_archive_from_reader(Trickle(std::io::Cursor::new(gz_tarball())), tmp.path())
+                .unwrap();
+
+        assert_eq!(done, Extracted::Done);
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("pkg/1.0/bin/tool")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn zip_streams_are_handed_back_to_the_file_path() {
+        let tmp = TempDir::new().unwrap();
+        let done = extract_archive_from_reader(&b"PK\x03\x04 not really"[..], tmp.path()).unwrap();
+        assert_eq!(done, Extracted::NeedsSeek);
+        assert!(fs::read_dir(tmp.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn garbage_streams_fail_cleanly() {
+        let tmp = TempDir::new().unwrap();
+        assert!(
+            extract_archive_from_reader(&b"this is not an archive at all"[..], tmp.path()).is_err()
+        );
+        assert!(extract_archive_from_reader(&b""[..], tmp.path()).is_err());
+    }
+
+    use std::fs;
 }
 
 #[cfg(test)]

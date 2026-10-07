@@ -1,8 +1,10 @@
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use crate::extraction::extract::extract_archive;
+use tempfile::TempDir;
+
+use crate::extraction::extract::{Extracted, extract_archive, extract_archive_from_reader};
 use zb_core::Error;
 
 #[derive(Debug, Clone)]
@@ -80,32 +82,87 @@ impl Store {
         fingerprint: &str,
         prepare: impl FnOnce(&Path) -> Result<(), Error>,
     ) -> Result<PathBuf, Error> {
-        let entry_path = self.entry_path(store_key);
-
         // Fast path: already prepared for this fingerprint
         if self.is_ready(store_key, fingerprint) {
-            return Ok(entry_path);
+            return Ok(self.entry_path(store_key));
         }
 
-        // Acquire exclusive lock for this store_key
-        let lock_path = self.locks_dir.join(format!("{store_key}.lock"));
-        let lock_file =
-            File::create(&lock_path).map_err(Error::store("failed to create lock file"))?;
-
-        lock_file
-            .lock()
-            .map_err(Error::store("failed to acquire lock"))?;
+        let _lock = self.lock_entry(store_key)?;
 
         // Double-check after acquiring lock (another process may have created it)
         if self.is_ready(store_key, fingerprint) {
-            return Ok(entry_path);
+            return Ok(self.entry_path(store_key));
         }
 
+        let staged = self.stage(
+            store_key,
+            fingerprint,
+            |dir| extract_archive(blob_path, dir),
+            prepare,
+        )?;
+        self.publish(staged)
+    }
+
+    /// Like [`Store::ensure_entry`], but unpacking a stream rather than a
+    /// file, so a bottle can be unpacked while it is still downloading. The
+    /// result is published by [`StagedEntry::commit`] once the caller has
+    /// verified the stream, and discarded if it is dropped instead.
+    pub fn stage_entry(
+        &self,
+        store_key: &str,
+        reader: impl Read,
+        fingerprint: &str,
+        prepare: impl FnOnce(&Path) -> Result<(), Error>,
+    ) -> Result<StagedEntry, Error> {
+        self.stage(
+            store_key,
+            fingerprint,
+            |dir| match extract_archive_from_reader(reader, dir)? {
+                Extracted::Done => Ok(()),
+                Extracted::NeedsSeek => Err(Error::StoreCorruption {
+                    message: "archive format cannot be unpacked from a stream".to_string(),
+                }),
+            },
+            prepare,
+        )
+    }
+
+    /// Exclusive lock for `store_key`, held while the guard lives.
+    fn lock_entry(&self, store_key: &str) -> Result<File, Error> {
+        let lock_path = self.locks_dir.join(format!("{store_key}.lock"));
+        let lock_file =
+            File::create(&lock_path).map_err(Error::store("failed to create lock file"))?;
+        lock_file
+            .lock()
+            .map_err(Error::store("failed to acquire lock"))?;
+        Ok(lock_file)
+    }
+
+    /// Unpack with `unpack` and run `prepare`, both inside a temp dir in
+    /// the store, so nothing is visible until published.
+    fn stage(
+        &self,
+        store_key: &str,
+        fingerprint: &str,
+        unpack: impl FnOnce(&Path) -> Result<(), Error>,
+        prepare: impl FnOnce(&Path) -> Result<(), Error>,
+    ) -> Result<StagedEntry, Error> {
         let tmp_dir = tempfile::tempdir_in(&self.store_dir)
             .map_err(Error::store("failed to create temp directory"))?;
-
-        extract_archive(blob_path, tmp_dir.path())?;
+        unpack(tmp_dir.path())?;
         prepare(tmp_dir.path())?;
+        Ok(StagedEntry {
+            store: self.clone(),
+            store_key: store_key.to_string(),
+            fingerprint: fingerprint.to_string(),
+            tmp_dir,
+        })
+    }
+
+    /// Move a staged entry into place and mark it ready. The caller holds
+    /// the entry's lock.
+    fn publish(&self, staged: StagedEntry) -> Result<PathBuf, Error> {
+        let entry_path = self.entry_path(&staged.store_key);
 
         // An entry prepared for something else. Kegs cloned from it are
         // independent copies, so replacing it is safe.
@@ -113,21 +170,20 @@ impl Store {
             fs::remove_dir_all(&entry_path)
                 .map_err(Error::store("failed to remove outdated store entry"))?;
         }
-        let _ = fs::remove_file(self.ready_path(store_key));
+        let _ = fs::remove_file(self.ready_path(&staged.store_key));
 
         // Persist the temp dir by converting it into a permanent path.
         // into_path() prevents auto-cleanup so rename failure still needs manual handling.
-        let tmp_path = tmp_dir.keep();
+        let tmp_path = staged.tmp_dir.keep();
         if let Err(e) = fs::rename(&tmp_path, &entry_path) {
             let _ = fs::remove_dir_all(&tmp_path);
             return Err(Error::StoreCorruption {
                 message: format!("failed to rename store entry: {e}"),
             });
         }
-        fs::write(self.ready_path(store_key), fingerprint)
+        fs::write(self.ready_path(&staged.store_key), &staged.fingerprint)
             .map_err(Error::store("failed to mark store entry ready"))?;
 
-        // Lock will be released when lock_file is dropped
         Ok(entry_path)
     }
 
@@ -139,14 +195,8 @@ impl Store {
             return Ok(());
         }
 
-        // Acquire exclusive lock for this store_key
         let lock_path = self.locks_dir.join(format!("{store_key}.lock"));
-        let lock_file =
-            File::create(&lock_path).map_err(Error::store("failed to create lock file"))?;
-
-        lock_file
-            .lock()
-            .map_err(Error::store("failed to acquire lock"))?;
+        let _lock = self.lock_entry(store_key)?;
 
         let _ = fs::remove_file(self.ready_path(store_key));
         if entry_path.exists() {
@@ -158,6 +208,38 @@ impl Store {
         let _ = fs::remove_file(&lock_path);
 
         Ok(())
+    }
+}
+
+/// A store entry that is unpacked and prepared but not yet visible. Dropping
+/// it discards the work; [`StagedEntry::commit`] publishes it.
+pub struct StagedEntry {
+    store: Store,
+    store_key: String,
+    fingerprint: String,
+    tmp_dir: TempDir,
+}
+
+impl std::fmt::Debug for StagedEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagedEntry")
+            .field("store_key", &self.store_key)
+            .field("fingerprint", &self.fingerprint)
+            .field("tmp_dir", &self.tmp_dir.path())
+            .finish()
+    }
+}
+
+impl StagedEntry {
+    /// Publish the entry, unless another process published one for the
+    /// same fingerprint in the meantime, in which case that one is kept.
+    pub fn commit(self) -> Result<PathBuf, Error> {
+        let store = self.store.clone();
+        let _lock = store.lock_entry(&self.store_key)?;
+        if store.is_ready(&self.store_key, &self.fingerprint) {
+            return Ok(store.entry_path(&self.store_key));
+        }
+        store.publish(self)
     }
 }
 
@@ -339,6 +421,98 @@ mod tests {
         assert_eq!(
             fs::read_to_string(entry.join("test.txt")).unwrap(),
             "prepared"
+        );
+    }
+
+    #[test]
+    fn a_staged_entry_is_invisible_until_committed() {
+        let (_tmp, store, blob_path) = store_with_blob(b"streamed");
+        let blob = fs::File::open(&blob_path).unwrap();
+
+        let staged = store
+            .stage_entry("staged", blob, "fp", |root| {
+                fs::write(root.join("test.txt"), "prepared").unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!store.has_entry("staged"));
+        assert!(!store.is_ready("staged", "fp"));
+
+        let path = staged.commit().unwrap();
+
+        assert_eq!(path, store.entry_path("staged"));
+        assert!(store.is_ready("staged", "fp"));
+        assert_eq!(
+            fs::read_to_string(path.join("test.txt")).unwrap(),
+            "prepared"
+        );
+    }
+
+    #[test]
+    fn a_dropped_staged_entry_leaves_nothing_behind() {
+        let (tmp, store, blob_path) = store_with_blob(b"streamed");
+        let blob = fs::File::open(&blob_path).unwrap();
+
+        let staged = store.stage_entry("dropped", blob, "fp", nothing).unwrap();
+        drop(staged);
+
+        assert!(!store.has_entry("dropped"));
+        let leftovers: Vec<_> = fs::read_dir(tmp.path().join("store"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp dir not cleaned up: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn committing_after_someone_else_published_keeps_theirs() {
+        let (_tmp, store, blob_path) = store_with_blob(b"streamed");
+        let blob = fs::File::open(&blob_path).unwrap();
+        let staged = store
+            .stage_entry("raced", blob, "fp", |root| {
+                fs::write(root.join("test.txt"), "mine").unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        // Another process got there first with the same fingerprint.
+        store
+            .ensure_entry("raced", &blob_path, "fp", |root| {
+                fs::write(root.join("test.txt"), "theirs").unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        let path = staged.commit().unwrap();
+        assert_eq!(fs::read_to_string(path.join("test.txt")).unwrap(), "theirs");
+
+        // A different fingerprint is replaced, as with ensure_entry.
+        let blob = fs::File::open(&blob_path).unwrap();
+        let staged = store.stage_entry("raced", blob, "fp2", nothing).unwrap();
+        staged.commit().unwrap();
+        assert!(store.is_ready("raced", "fp2"));
+        assert_eq!(
+            fs::read_to_string(store.entry_path("raced").join("test.txt")).unwrap(),
+            "streamed"
+        );
+    }
+
+    #[test]
+    fn a_stream_that_is_not_an_archive_cannot_be_staged() {
+        let (tmp, store, _blob_path) = store_with_blob(b"x");
+        let err = store
+            .stage_entry("bad", &b"definitely not a tarball"[..], "fp", nothing)
+            .unwrap_err();
+        assert!(matches!(err, Error::StoreCorruption { .. }), "{err}");
+        assert!(
+            fs::read_dir(tmp.path().join("store"))
+                .unwrap()
+                .next()
+                .is_none()
         );
     }
 
