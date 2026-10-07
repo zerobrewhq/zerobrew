@@ -202,9 +202,11 @@ Measured on 2026-09-30 with zerobrew 0.3.3 and Homebrew 7.0.7 on macOS 26.6.2, M
 
 </details>
 
-To reproduce, run `just bench --full results/` on a machine with nothing installed in Homebrew. It resets zerobrew, uninstalls everything it installed in Homebrew, and writes a README-ready table to `results/benchmark.md`.
+To reproduce, run `just bench --full results/` on a machine with nothing installed in Homebrew. It resets zerobrew, uninstalls everything it installed in Homebrew, and writes a table to `results/benchmark.md`.
 
-A smaller version runs in CI every night and on every change to the install code: the [parity workflow](https://github.com/zerobrewhq/zerobrew/actions/workflows/parity.yml) installs a fixed set of formulae cold with both tools on the same runner, compares the resulting prefixes byte for byte, and fails if zerobrew is less than 1.5x faster than Homebrew on any of them or more than 20% slower than the last zerobrew release. The per-run numbers are in each run's summary.
+A smaller version runs in CI: the [parity workflow](https://github.com/zerobrewhq/zerobrew/actions/workflows/parity.yml) installs a fixed set of formulae with both tools on the same runner and compares the resulting prefixes byte for byte, and the [timing workflow](https://github.com/zerobrewhq/zerobrew/actions/workflows/timing.yml) times those formulae plus node and python@3.14, cold and warm, with both tools and with the last zerobrew release. 
+
+The nightly timing run fails if zerobrew is less than 1.5x faster than Homebrew cold or 3x warm on any of them, or more than 20% slower than the last release overall.
 
 ## Relationship with Homebrew
 
@@ -233,6 +235,6 @@ doing so.
   </a>
 </div>
 
-- **Status:** Experimental, but already useful for many common Homebrew formulas.
+- **Status:** Experimental, but quite useful. I ([@cachebag](https://github.com/cachebag) daily drive it myself).
 - **Feedback:** If you hit incompatibilities, please open an issue or PR.
 - **License:** Dual-licensed under [Apache 2.0](./LICENSE-APACHE.md) OR [MIT](./LICENSE-MIT.md), at your choice.

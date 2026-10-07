@@ -18,7 +18,7 @@
 //! macOS only for now: binaries are compared through `otool` and `codesign`.
 #![cfg(target_os = "macos")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
@@ -632,37 +632,6 @@ fn links_match_homebrew() {
     assert_no_differences("links", &all_diffs);
 }
 
-/// How much faster than Homebrew `zb install` has to be, per case, as a
-/// ratio of wall-clock seconds. Read from `ZB_TIMING_MIN_SPEEDUP`; unset
-/// means report only. Hosted runners vary too much run to run for absolute
-/// times to mean anything, so only the ratio measured in one run is gated.
-fn min_speedup() -> Option<f64> {
-    let raw = std::env::var("ZB_TIMING_MIN_SPEEDUP").ok()?;
-    if raw.trim().is_empty() {
-        return None;
-    }
-    Some(
-        raw.trim()
-            .parse()
-            .unwrap_or_else(|e| panic!("ZB_TIMING_MIN_SPEEDUP={raw:?} is not a number: {e}")),
-    )
-}
-
-/// How much slower than the last release `zb install` may be, per case, as
-/// a ratio. Read from `ZB_TIMING_MAX_REGRESSION`; unset means report only.
-/// Only checked when `ZB_TIMING_BASELINE` names a released `zb`.
-fn max_regression() -> Option<f64> {
-    let raw = std::env::var("ZB_TIMING_MAX_REGRESSION").ok()?;
-    if raw.trim().is_empty() {
-        return None;
-    }
-    Some(
-        raw.trim()
-            .parse()
-            .unwrap_or_else(|e| panic!("ZB_TIMING_MAX_REGRESSION={raw:?} is not a number: {e}")),
-    )
-}
-
 /// A released `zb` to time alongside the one under test, named by
 /// `ZB_TIMING_BASELINE`. Comparing two zb builds in the same run is the only
 /// way to see a regression on hosted runners, whose speed varies run to run.
@@ -676,61 +645,96 @@ fn baseline_zb() -> Option<PathBuf> {
     Some(path)
 }
 
-/// How many times each zb build installs each case; the fastest run counts.
+/// Formulae timed but not compared file by file: big enough that the
+/// tool's own work shows in the numbers, too big for the byte comparison.
+const TIMING_ONLY: &[&str] = &["node", "python@3.14"];
+
+/// How many times each zb build installs each formula; the fastest run of
+/// each kind counts, since the slow ones are the network.
 const ZB_TIMING_ROUNDS: usize = 3;
+
+/// Cold is a first install: nothing cached. Warm is a reinstall: the
+/// package uninstalled, its downloads still cached.
+#[derive(Clone, Copy)]
+struct ColdWarm {
+    cold: Duration,
+    warm: Duration,
+}
+
+impl ColdWarm {
+    fn total(&self) -> f64 {
+        (self.cold + self.warm).as_secs_f64()
+    }
+}
 
 struct Timing {
     formula: &'static str,
-    brew: Duration,
-    zb: Duration,
-    /// The last release's time, when a baseline was given.
-    baseline: Option<Duration>,
+    brew: ColdWarm,
+    zb: ColdWarm,
+    /// The last release's times, when a baseline was given.
+    baseline: Option<ColdWarm>,
 }
 
 impl Timing {
-    fn speedup(&self) -> f64 {
-        self.brew.as_secs_f64() / self.zb.as_secs_f64()
+    fn cold_speedup(&self) -> f64 {
+        self.brew.cold.as_secs_f64() / self.zb.cold.as_secs_f64()
     }
 
-    /// Current time over the last release's: above 1 means slower.
+    fn warm_speedup(&self) -> f64 {
+        self.brew.warm.as_secs_f64() / self.zb.warm.as_secs_f64()
+    }
+
+    /// Current cold plus warm over the last release's: above 1 means slower.
     fn regression(&self) -> Option<f64> {
         self.baseline
-            .map(|baseline| self.zb.as_secs_f64() / baseline.as_secs_f64())
+            .map(|baseline| self.zb.total() / baseline.total())
     }
 }
 
-/// Make Homebrew forget `case` so its install downloads and pours like a
-/// first install: remove the kegs the runner may ship preinstalled and the
-/// bottles in its download cache.
-fn make_brew_cold(brew: &Brew, case: &Case) {
-    let installed: Vec<&str> = case
-        .kegs
+/// `formula` and everything installing it pulls in, as Homebrew sees it.
+fn brew_kegs(brew: &Brew, formula: &str) -> Vec<String> {
+    let deps = stdout(
+        &brew.run(&["deps", "--formula", formula]),
+        &format!("brew deps {formula}"),
+    );
+    std::iter::once(formula)
+        .chain(deps.lines())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Uninstall whichever of `kegs` Homebrew has.
+fn brew_uninstall(brew: &Brew, kegs: &[String]) {
+    let installed = stdout(&brew.run(&["list", "--formula", "-1"]), "brew list");
+    let installed: HashSet<&str> = installed.lines().map(str::trim).collect();
+    let present: Vec<&str> = kegs
         .iter()
-        .copied()
-        .filter(|keg| {
-            brew.run(&["list", "--formula", "--versions", keg])
-                .status
-                .success()
-        })
+        .map(String::as_str)
+        .filter(|keg| installed.contains(keg))
         .collect();
-    if !installed.is_empty() {
-        let mut args = vec!["uninstall", "--formula", "--ignore-dependencies", "--force"];
-        args.extend(installed);
-        assert_success(&brew.run(&args), "brew uninstall");
+    if present.is_empty() {
+        return;
     }
+    let mut args = vec!["uninstall", "--formula", "--ignore-dependencies", "--force"];
+    args.extend(present);
+    assert_success(&brew.run(&args), "brew uninstall");
+}
+
+/// Remove the cached bottles and manifests of `kegs`, so the next install
+/// downloads them again.
+fn brew_forget_downloads(brew: &Brew, kegs: &[String]) {
     let cache = PathBuf::from(stdout(&brew.run(&["--cache"]), "brew --cache")).join("downloads");
-    if let Ok(entries) = fs::read_dir(&cache) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // Download names look like `<sha>--<formula>--<version>.<tag>.bottle.tar.gz`
-            // and `<sha>--<formula>-<version>.bottle_manifest.json`.
-            if case
-                .kegs
-                .iter()
-                .any(|keg| name.contains(&format!("--{keg}-")))
-            {
-                let _ = fs::remove_file(entry.path());
-            }
+    let Ok(entries) = fs::read_dir(&cache) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // `<sha>--<formula>--<version>.<tag>.bottle.tar.gz` and
+        // `<sha>--<formula>-<version>.bottle_manifest.json`.
+        if kegs.iter().any(|keg| name.contains(&format!("--{keg}-"))) {
+            let _ = fs::remove_file(entry.path());
         }
     }
 }
@@ -741,33 +745,71 @@ fn timed<T>(f: impl FnOnce() -> T) -> (T, Duration) {
     (value, start.elapsed())
 }
 
+/// Time Homebrew installing `formula` cold, then again warm.
+fn time_brew(brew: &Brew, formula: &str) -> ColdWarm {
+    let kegs = brew_kegs(brew, formula);
+    let install = || {
+        assert_success(
+            &brew.run(&["install", "--formula", formula]),
+            &format!("brew install {formula}"),
+        )
+    };
+    brew_uninstall(brew, &kegs);
+    brew_forget_downloads(brew, &kegs);
+    let (_, cold) = timed(install);
+    brew_uninstall(brew, &kegs);
+    let (_, warm) = timed(install);
+    ColdWarm { cold, warm }
+}
+
+/// Time one zb build installing `formula` cold in a fresh root, then warm
+/// after uninstalling. The formula index is refreshed before the clock
+/// starts, as `brew update` runs before Homebrew is timed.
+fn time_zb(bin: Option<&Path>, formula: &str) -> ColdWarm {
+    let zb = match bin {
+        Some(bin) => Zb::with_binary(bin.to_path_buf()),
+        None => Zb::new(),
+    };
+    assert_success(&zb.run(&["update"]), "zb update");
+    let (_, cold) = timed(|| zb.install(formula));
+    assert_success(&zb.run(&["uninstall", "--all"]), "zb uninstall --all");
+    let (_, warm) = timed(|| zb.install(formula));
+    ColdWarm { cold, warm }
+}
+
 fn timing_table(timings: &[Timing]) -> String {
     let with_baseline = timings.iter().any(|t| t.baseline.is_some());
-    let mut table = String::from("| formula | homebrew | zerobrew | speedup |");
+    let mut table = String::from(
+        "| formula | homebrew cold | zerobrew cold | speedup | homebrew warm | zerobrew warm | speedup |",
+    );
     if with_baseline {
-        table.push_str(" last release | vs release |");
+        table.push_str(" release cold | release warm | vs release |");
     }
-    table.push_str("\n|---|---:|---:|---:|");
+    table.push_str("\n|---|---:|---:|---:|---:|---:|---:|");
     if with_baseline {
-        table.push_str("---:|---:|");
+        table.push_str("---:|---:|---:|");
     }
     table.push('\n');
     for t in timings {
         table.push_str(&format!(
-            "| {} | {:.2}s | {:.2}s | {:.1}x |",
+            "| {} | {:.2}s | {:.2}s | {:.1}x | {:.2}s | {:.2}s | {:.1}x |",
             t.formula,
-            t.brew.as_secs_f64(),
-            t.zb.as_secs_f64(),
-            t.speedup()
+            t.brew.cold.as_secs_f64(),
+            t.zb.cold.as_secs_f64(),
+            t.cold_speedup(),
+            t.brew.warm.as_secs_f64(),
+            t.zb.warm.as_secs_f64(),
+            t.warm_speedup(),
         ));
         if with_baseline {
             match (t.baseline, t.regression()) {
                 (Some(baseline), Some(ratio)) => table.push_str(&format!(
-                    " {:.2}s | {:+.0}% |",
-                    baseline.as_secs_f64(),
+                    " {:.2}s | {:.2}s | {:+.0}% |",
+                    baseline.cold.as_secs_f64(),
+                    baseline.warm.as_secs_f64(),
                     (ratio - 1.0) * 100.0
                 )),
-                _ => table.push_str(" - | - |"),
+                _ => table.push_str(" - | - | - |"),
             }
         }
         table.push('\n');
@@ -775,13 +817,29 @@ fn timing_table(timings: &[Timing]) -> String {
     table
 }
 
-/// Install every case cold with both tools and compare wall-clock time.
+/// A ratio read from the environment; unset or empty means no gate.
+fn ratio_from_env(name: &str) -> Option<f64> {
+    let raw = std::env::var(name).ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(
+        raw.trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("{name}={raw:?} is not a number: {e}")),
+    )
+}
+
+/// Install the parity formulae and [`TIMING_ONLY`] with both tools, cold
+/// and warm, and compare wall-clock time. The last release is timed in the
+/// same run when `ZB_TIMING_BASELINE` names it: the only comparison that
+/// holds on hosted runners, whose speed varies run to run.
 ///
-/// Runs in its own CI job on a fresh runner, so nothing is cached for either
-/// tool. `brew update` runs once beforehand and is not timed: zb has no
-/// equivalent step, and the API refresh is the part of `brew install` that
-/// depends most on the network. See
-/// https://github.com/zerobrewhq/zerobrew/issues/422
+/// Gates, all unset by default: `ZB_TIMING_MIN_SPEEDUP` and
+/// `ZB_TIMING_MIN_WARM_SPEEDUP` are the least zb may beat Homebrew by, cold
+/// and warm, on any formula; `ZB_TIMING_MAX_REGRESSION` is the most zb may
+/// be slower than the last release over all formulae, cold and warm
+/// together. See https://github.com/zerobrewhq/zerobrew/issues/422
 #[test]
 fn install_timings() {
     let Some(brew) = Brew::find() else {
@@ -790,47 +848,47 @@ fn install_timings() {
     if std::env::var_os("ZB_PARITY_BREW").is_none() {
         assert_success(&brew.run(&["update", "--quiet"]), "brew update");
     }
+    let release = baseline_zb();
+
+    let formulas: Vec<&'static str> = CASES
+        .iter()
+        .filter(|case| !case.needs_default_prefix || brew.prefix == Path::new("/opt/homebrew"))
+        .map(|case| case.formula)
+        .chain(TIMING_ONLY.iter().copied())
+        .collect();
 
     let mut timings = Vec::new();
-    for case in CASES {
-        if case.needs_default_prefix && brew.prefix != Path::new("/opt/homebrew") {
-            continue;
-        }
-        make_brew_cold(&brew, case);
-        let (_, brew_time) = timed(|| {
-            assert_success(
-                &brew.run(&["install", "--formula", case.formula]),
-                &format!("brew install {}", case.formula),
-            )
-        });
-        // zb installs are short enough to repeat. Each round installs into a
-        // fresh root with the build under test and the release in alternating
-        // order, so neither always gets the warmer CDN edge, and the fastest
-        // run counts: the slowest ones are the network, not the tool.
-        let release = baseline_zb();
-        let mut zb_times = Vec::new();
-        let mut baseline_times = Vec::new();
+    for formula in formulas {
+        let brew_times = time_brew(&brew, formula);
+
+        // Rounds alternate which build goes first, so neither always gets
+        // the warmer CDN edge.
+        let mut zb_runs = Vec::new();
+        let mut release_runs = Vec::new();
         for round in 0..ZB_TIMING_ROUNDS {
-            let time_current = || timed(|| Zb::new().install(case.formula)).1;
-            let time_release =
-                |bin: &PathBuf| timed(|| Zb::with_binary(bin.clone()).install(case.formula)).1;
             match &release {
                 Some(bin) if round % 2 == 1 => {
-                    baseline_times.push(time_release(bin));
-                    zb_times.push(time_current());
+                    release_runs.push(time_zb(Some(bin), formula));
+                    zb_runs.push(time_zb(None, formula));
                 }
                 Some(bin) => {
-                    zb_times.push(time_current());
-                    baseline_times.push(time_release(bin));
+                    zb_runs.push(time_zb(None, formula));
+                    release_runs.push(time_zb(Some(bin), formula));
                 }
-                None => zb_times.push(time_current()),
+                None => zb_runs.push(time_zb(None, formula)),
             }
         }
+        let fastest = |runs: &[ColdWarm]| {
+            Some(ColdWarm {
+                cold: runs.iter().map(|r| r.cold).min()?,
+                warm: runs.iter().map(|r| r.warm).min()?,
+            })
+        };
         timings.push(Timing {
-            formula: case.formula,
-            brew: brew_time,
-            zb: zb_times.into_iter().min().unwrap(),
-            baseline: baseline_times.into_iter().min(),
+            formula,
+            brew: brew_times,
+            zb: fastest(&zb_runs).expect("at least one round"),
+            baseline: fastest(&release_runs),
         });
     }
 
@@ -842,38 +900,47 @@ fn install_timings() {
             .create(true)
             .open(summary)
             .expect("cannot open GITHUB_STEP_SUMMARY");
-        writeln!(file, "### install timings, cold\n\n{table}").expect("cannot write summary");
+        writeln!(file, "### install timings\n\n{table}").expect("cannot write summary");
     }
-    // For the workflow to post on the pull request.
     if let Some(path) = std::env::var_os("ZB_TIMING_TABLE") {
         fs::write(path, &table).expect("cannot write ZB_TIMING_TABLE");
     }
 
-    if let Some(min) = min_speedup() {
-        let slow: Vec<String> = timings
-            .iter()
-            .filter(|t| t.speedup() < min)
-            .map(|t| format!("{}: {:.1}x (need {min}x)", t.formula, t.speedup()))
-            .collect();
-        assert!(
-            slow.is_empty(),
-            "zb install is not {min}x faster than Homebrew for:\n{}",
-            slow.join("\n")
+    let mut slow = Vec::new();
+    if let Some(min) = ratio_from_env("ZB_TIMING_MIN_SPEEDUP") {
+        slow.extend(
+            timings
+                .iter()
+                .filter(|t| t.cold_speedup() < min)
+                .map(|t| format!("{} cold: {:.1}x (need {min}x)", t.formula, t.cold_speedup())),
         );
     }
+    if let Some(min) = ratio_from_env("ZB_TIMING_MIN_WARM_SPEEDUP") {
+        slow.extend(
+            timings
+                .iter()
+                .filter(|t| t.warm_speedup() < min)
+                .map(|t| format!("{} warm: {:.1}x (need {min}x)", t.formula, t.warm_speedup())),
+        );
+    }
+    assert!(
+        slow.is_empty(),
+        "zb install is not fast enough against Homebrew for:\n{}\n{table}",
+        slow.join("\n")
+    );
 
-    if let Some(max) = max_regression() {
+    if let Some(max) = ratio_from_env("ZB_TIMING_MAX_REGRESSION") {
         // One number for the whole set: a real slowdown shows up in every
-        // case, a network hiccup in one.
+        // formula, a network hiccup in one.
         let (current, release): (f64, f64) = timings
             .iter()
-            .filter_map(|t| t.baseline.map(|b| (t.zb.as_secs_f64(), b.as_secs_f64())))
+            .filter_map(|t| t.baseline.map(|b| (t.zb.total(), b.total())))
             .fold((0.0, 0.0), |(c, r), (zb, b)| (c + zb, r + b));
         if release > 0.0 {
             let ratio = current / release;
             assert!(
                 ratio <= max,
-                "zb install is {:+.0}% slower than the last release over all cases (limit {:+.0}%)\n{table}",
+                "zb install is {:+.0}% slower than the last release over all formulae (limit {:+.0}%)\n{table}",
                 (ratio - 1.0) * 100.0,
                 (max - 1.0) * 100.0
             );

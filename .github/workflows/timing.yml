@@ -1,0 +1,96 @@
+name: timing
+
+on:
+  pull_request:
+    paths:
+      - 'zb_core/src/**'
+      - 'zb_io/src/cellar/**'
+      - 'zb_io/src/extraction/**'
+      - 'zb_io/src/installer/**'
+      - 'zb_io/src/network/**'
+      - 'zb_io/src/storage/**'
+      - 'zb_io/Cargo.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'zb_cli/tests/parity.rs'
+      - '.github/workflows/timing.yml'
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: timing-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  timing:
+    name: macos-arm64 / rust ${{ matrix.rust }}
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        rust: ["1.96"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: cache rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-latest-${{ matrix.rust }}-release
+
+      - name: homebrew version
+        run: brew --version
+
+      - name: download the last release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo "$GITHUB_REPOSITORY" --pattern zb-darwin-arm64 --output /tmp/zb-release
+          chmod +x /tmp/zb-release
+          /tmp/zb-release --version
+
+      # Gated on the nightly run only; pull requests report.
+      - name: time installs
+        env:
+          ZB_PARITY_REQUIRE_BREW: "1"
+          ZB_TIMING_BASELINE: /tmp/zb-release
+          ZB_TIMING_MIN_SPEEDUP: ${{ github.event_name == 'schedule' && '1.5' || '' }}
+          ZB_TIMING_MIN_WARM_SPEEDUP: ${{ github.event_name == 'schedule' && '3' || '' }}
+          ZB_TIMING_MAX_REGRESSION: ${{ github.event_name == 'schedule' && '1.2' || '' }}
+          ZB_TIMING_TABLE: /tmp/zb-timing.md
+        run: cargo test --release --package zb_cli --features parity --test parity -- --nocapture install_timings
+
+      # The token is read-only for pull requests from forks; those only get
+      # the job summary.
+      - name: comment the table on the pull request
+        if: github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          marker='<!-- zb-timing -->'
+          {
+            echo "$marker"
+            echo "### install timings"
+            echo
+            cat /tmp/zb-timing.md
+            echo
+            echo "_${SHA:0:7}, macos-latest. Cold: nothing cached. Warm: uninstalled, downloads cached. Each zb build 3 rounds, fastest counts; release is the newest GitHub release._"
+          } > /tmp/zb-timing-comment.md
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -1)
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" \
+              -F body=@/tmp/zb-timing-comment.md >/dev/null
+          else
+            gh pr comment "$PR" --body-file /tmp/zb-timing-comment.md
+          fi

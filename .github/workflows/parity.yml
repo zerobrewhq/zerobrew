@@ -1,15 +1,3 @@
-# Installs the same formulae with Homebrew and with zb on the same runner.
-#
-# parity: compares what landed on disk. Homebrew is the reference, so a
-# failure here means zb wrote something Homebrew would not have, or Homebrew
-# changed. See https://github.com/zerobrewhq/zerobrew/issues/421.
-#
-# timing: installs every case cold with both tools and compares wall-clock
-# time, and times the last release too. Its own job, so nothing is cached for
-# either tool. Nightly runs fail when zb is not at least ZB_TIMING_MIN_SPEEDUP
-# times faster than Homebrew on any case, or more than ZB_TIMING_MAX_REGRESSION
-# times slower than the last release over all cases; pull requests only report.
-# See https://github.com/zerobrewhq/zerobrew/issues/422.
 name: parity
 
 on:
@@ -29,14 +17,11 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/parity.yml'
   schedule:
-    # Nightly, so drift on Homebrew's side is caught even when nothing is pushed.
     - cron: '17 6 * * *'
   workflow_dispatch:
 
-# The timing job comments its table on pull requests.
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
   group: parity-${{ github.ref }}
@@ -65,82 +50,9 @@ jobs:
       - name: homebrew version
         run: brew --version
 
-      # The runner ships Homebrew. REQUIRE_BREW turns a missing one into a
-      # failure instead of a silent skip.
+      # One at a time: the tests share the runner's Homebrew, which locks
+      # per install.
       - name: run parity tests
         env:
           ZB_PARITY_REQUIRE_BREW: "1"
-        # One at a time: the tests share the runner's Homebrew, and brew takes
-        # a lock per install.
         run: cargo test --package zb_cli --features parity --test parity -- --nocapture --test-threads=1 --skip install_timings
-
-  timing:
-    name: timing / macos-arm64 / rust ${{ matrix.rust }}
-    runs-on: macos-latest
-    strategy:
-      matrix:
-        rust: ["1.96"]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: install rust ${{ matrix.rust }}
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
-
-      - name: cache rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: macos-latest-${{ matrix.rust }}-release
-
-      - name: homebrew version
-        run: brew --version
-
-      # The last release is timed in the same run, which is the only
-      # comparison that holds on hosted runners.
-      - name: download the last release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release download --repo "$GITHUB_REPOSITORY" --pattern zb-darwin-arm64 --output /tmp/zb-release
-          chmod +x /tmp/zb-release
-          /tmp/zb-release --version
-
-      # Release build: a debug zb is several times slower and would measure
-      # the compiler, not the tool.
-      - name: time installs
-        env:
-          ZB_PARITY_REQUIRE_BREW: "1"
-          ZB_TIMING_BASELINE: /tmp/zb-release
-          ZB_TIMING_MIN_SPEEDUP: ${{ github.event_name == 'schedule' && '1.5' || '' }}
-          ZB_TIMING_MAX_REGRESSION: ${{ github.event_name == 'schedule' && '1.2' || '' }}
-          ZB_TIMING_TABLE: /tmp/zb-timing.md
-        run: cargo test --release --package zb_cli --features parity --test parity -- --nocapture install_timings
-
-      # One comment per pull request, edited on every run so it never piles
-      # up. The token is read-only for pull requests from forks, so those
-      # only get the job summary.
-      - name: comment the table on the pull request
-        if: github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
-          SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          marker='<!-- zb-timing -->'
-          {
-            echo "$marker"
-            echo "### install timings, cold"
-            echo
-            cat /tmp/zb-timing.md
-            echo
-            echo "_${SHA:0:7}, macos-latest, each zb build 3 rounds, fastest counts. Last release is the newest GitHub release._"
-          } > /tmp/zb-timing-comment.md
-          existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
-            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -1)
-          if [ -n "$existing" ]; then
-            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" \
-              -F body=@/tmp/zb-timing-comment.md >/dev/null
-          else
-            gh pr comment "$PR" --body-file /tmp/zb-timing-comment.md
-          fi
