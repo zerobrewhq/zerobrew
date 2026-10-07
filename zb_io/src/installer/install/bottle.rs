@@ -37,9 +37,9 @@ impl Installer {
             .extract_with_retry(download, &item.formula, bottle, download_progress.clone())
             .await?;
 
-        let keg_path =
-            self.cellar
-                .materialize(formula_name, &version, &store_entry, bottle.build_prefix())?;
+        let keg_path = self
+            .cellar
+            .materialize(formula_name, &version, &store_entry)?;
 
         // Before recording the install, so a failure doesn't leave the
         // package marked installed without its config files.
@@ -124,9 +124,22 @@ impl Installer {
     ) -> Result<std::path::PathBuf, Error> {
         let mut blob_path = download.blob_path.clone();
         let mut last_error = None;
+        let version = formula.effective_version();
+        let fingerprint = self.cellar.relocation_fingerprint(bottle.build_prefix());
 
         for attempt in 0..MAX_CORRUPTION_RETRIES {
-            match self.store.ensure_entry(&bottle.sha256, &blob_path) {
+            let relocate = |extracted: &Path| {
+                self.cellar.relocate_extracted(
+                    extracted,
+                    &formula.name,
+                    &version,
+                    bottle.build_prefix(),
+                )
+            };
+            match self
+                .store
+                .ensure_entry(&bottle.sha256, &blob_path, &fingerprint, relocate)
+            {
                 Ok(entry) => return Ok(entry),
                 Err(Error::StoreCorruption { message }) => {
                     self.downloader.remove_blob(&bottle.sha256);
@@ -264,7 +277,10 @@ impl Installer {
         );
 
         if crate::extraction::is_archive(&blob_path)? {
-            let extracted = self.store.ensure_entry(&cask.sha256, &blob_path)?;
+            // Cask archives are staged file by file; nothing to prepare.
+            let extracted =
+                self.store
+                    .ensure_entry(&cask.sha256, &blob_path, "cask v1\n", |_| Ok(()))?;
             stage_cask_binaries(&extracted, &keg_path, &cask)?;
         } else {
             stage_raw_cask_binary(&blob_path, &keg_path, &cask)?;
