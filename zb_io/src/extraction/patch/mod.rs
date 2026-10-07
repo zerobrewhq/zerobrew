@@ -13,4 +13,4 @@ pub(crate) mod text;
 pub use linux::patch_placeholders;
 
 #[cfg(target_os = "macos")]
-pub use macos::{codesign_and_strip_xattrs, patch_homebrew_placeholders};
+pub use macos::relocate_keg;

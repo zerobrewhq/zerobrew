@@ -5,6 +5,8 @@ use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+use memchr::memmem;
+
 use super::phar;
 
 /// Replace each `(from, to)` pair in the file at `path`, in order.
@@ -14,11 +16,16 @@ use super::phar;
 /// Other files with NUL bytes in their first 8 KiB are treated as binaries
 /// and left alone. PHP archives get their signature recomputed after
 /// patching. Returns whether the file changed.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn rewrite_text_file(path: &Path, replacements: &[(&str, &str)]) -> io::Result<bool> {
     if is_binary(path)? {
         return Ok(false);
     }
+    rewrite_text(path, replacements)
+}
 
+/// [`rewrite_text_file`] for a file the caller already knows is text.
+pub(crate) fn rewrite_text(path: &Path, replacements: &[(&str, &str)]) -> io::Result<bool> {
     let mut content = fs::read(path)?;
     let mut changed = false;
     for (from, to) in replacements {
@@ -51,10 +58,14 @@ pub(crate) fn is_binary(path: &Path) -> io::Result<bool> {
 }
 
 fn replace_all(haystack: &[u8], from: &[u8], to: &[u8]) -> Option<Vec<u8>> {
+    if from.is_empty() {
+        return None;
+    }
+    let finder = memmem::Finder::new(from);
     let mut rest = haystack;
     let mut out = Vec::new();
     let mut found = false;
-    while let Some(i) = find(rest, from) {
+    while let Some(i) = finder.find(rest) {
         found = true;
         out.extend_from_slice(&rest[..i]);
         out.extend_from_slice(to);
@@ -65,13 +76,6 @@ fn replace_all(haystack: &[u8], from: &[u8], to: &[u8]) -> Option<Vec<u8>> {
     }
     out.extend_from_slice(rest);
     Some(out)
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn write_preserving_mode(path: &Path, content: &[u8]) -> io::Result<()> {

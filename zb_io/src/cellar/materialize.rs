@@ -7,7 +7,7 @@ use zb_core::Error;
 use crate::extraction::patch::linux::patch_placeholders;
 
 #[cfg(target_os = "macos")]
-use crate::extraction::patch::macos::{codesign_and_strip_xattrs, patch_homebrew_placeholders};
+use crate::extraction::patch::macos::relocate_keg;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyStrategy {
@@ -119,9 +119,9 @@ impl Cellar {
         // Copy the content to the cellar using best available strategy
         copy_dir_with_fallback(&src_path, &keg_path)?;
 
-        // Patch Homebrew placeholders in Mach-O binaries
+        // Rewrite Homebrew placeholders and paths, re-sign, strip quarantine
         #[cfg(target_os = "macos")]
-        patch_homebrew_placeholders(&keg_path, &self.cellar_dir, name, version, build_prefix)?;
+        relocate_keg(&keg_path, &self.cellar_dir, name, version, build_prefix)?;
 
         // Patch Homebrew placeholders in ELF binaries
         #[cfg(target_os = "linux")]
@@ -141,10 +141,6 @@ impl Cellar {
                 })?;
             patch_placeholders(&keg_path, prefix, name, version)?;
         }
-
-        // Strip quarantine xattrs and ad-hoc sign Mach-O binaries
-        #[cfg(target_os = "macos")]
-        codesign_and_strip_xattrs(&keg_path)?;
 
         Ok(keg_path)
     }

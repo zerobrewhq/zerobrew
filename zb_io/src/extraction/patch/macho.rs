@@ -61,12 +61,8 @@ pub(crate) struct Rewrite {
     /// Byte ranges that were changed, so the caller can write only those.
     pub(crate) written: Vec<Range<usize>>,
     pub(crate) unfit: Vec<UnfitChange>,
-}
-
-impl Rewrite {
-    pub(crate) fn changed(&self) -> bool {
-        !self.written.is_empty()
-    }
+    /// Whether the file was signed before the rewrite; see [`MachoInfo`].
+    pub(crate) signed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,7 +136,10 @@ pub(crate) fn rewrite(
     mut map: impl FnMut(PathKind, &str) -> Option<String>,
 ) -> Result<Rewrite, MachoError> {
     let info = inspect(data)?;
-    let mut rewrite = Rewrite::default();
+    let mut rewrite = Rewrite {
+        signed: info.signed,
+        ..Rewrite::default()
+    };
     for path in info.paths {
         // A path that is not UTF-8 cannot be matched against the prefixes we
         // know, and writing a lossy decoding back would corrupt it.
@@ -542,7 +541,7 @@ mod tests {
         })
         .unwrap();
 
-        assert!(rewrite.changed());
+        assert!(!rewrite.written.is_empty());
         assert!(rewrite.unfit.is_empty());
         assert_eq!(data.len(), original.len());
         let info = inspect(&data).unwrap();
@@ -571,7 +570,7 @@ mod tests {
 
         let rewrite = rewrite(&mut data, |_, _| Some("/a/b/cd".into())).unwrap();
 
-        assert!(rewrite.changed());
+        assert!(!rewrite.written.is_empty());
         assert!(rewrite.unfit.is_empty());
         assert_eq!(
             values(&inspect(&data).unwrap()),
@@ -597,7 +596,8 @@ mod tests {
         })
         .unwrap();
 
-        assert!(!rewrite.changed());
+        assert!(rewrite.written.is_empty());
+        assert!(!rewrite.signed);
         assert_eq!(
             rewrite.unfit,
             [UnfitChange {
@@ -616,7 +616,7 @@ mod tests {
 
         let rewrite = rewrite(&mut data, |_, path| Some(path.to_string())).unwrap();
 
-        assert!(!rewrite.changed());
+        assert!(rewrite.written.is_empty());
         assert_eq!(data, original);
     }
 
@@ -684,7 +684,7 @@ mod tests {
         );
 
         // A fat arch that points past the end of the file.
-        let mut bad_fat = fat(&[good.clone()]);
+        let mut bad_fat = fat(std::slice::from_ref(&good));
         bad_fat[8 + 12..8 + 16].copy_from_slice(&0xffffu32.to_be_bytes());
         assert_eq!(
             inspect(&bad_fat).unwrap_err(),
