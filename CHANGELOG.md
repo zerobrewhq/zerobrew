@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `zb doctor` reports installed packages that load a library that no longer exists, such as after a dependency changed major version. macOS only for now, and report-only
 
 ### Changed
+- Bottles are relocated in-process on macOS: load commands are rewritten in place instead of running `otool` and one `install_name_tool` per library reference, which copied the whole binary each time. Warm installs of packages with many libraries are 3x to 17x faster (node 11.6s to 0.7s, llvm 7.4s to 2.2s). Placeholder rpaths, which the old pass never saw, are now rewritten too ([#427](https://github.com/zerobrewhq/zerobrew/pull/427))
 - CI times a cold install of each parity formula with Homebrew, with zerobrew and with the last zerobrew release on the same runner. The nightly run fails if zerobrew is less than 1.5x faster than Homebrew on any formula, or more than 20% slower than the last release over all of them ([#422](https://github.com/zerobrewhq/zerobrew/issues/422))
 - The repository moved to the [`zerobrewhq`](https://github.com/zerobrewhq/zerobrew) organisation. Old `lucasgelfond/zerobrew` links redirect, and the install script and release downloads now use the new address
 - The Homebrew tap moved to `zerobrewhq/zerobrew`. Installs from `cachebag/zerobrew` keep updating, since that tap was transferred rather than replaced
