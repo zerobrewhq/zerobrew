@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `zb doctor` reports installed packages that load a library that no longer exists, such as after a dependency changed major version. macOS only for now, and report-only
 
 ### Changed
+- CI times a cold install of each parity formula with Homebrew and with zerobrew on the same runner, and the nightly run fails if zerobrew is less than 1.5x faster on any of them ([#422](https://github.com/zerobrewhq/zerobrew/issues/422))
 - The repository moved to the [`zerobrewhq`](https://github.com/zerobrewhq/zerobrew) organisation. Old `lucasgelfond/zerobrew` links redirect, and the install script and release downloads now use the new address
 - The Homebrew tap moved to `zerobrewhq/zerobrew`. Installs from `cachebag/zerobrew` keep updating, since that tap was transferred rather than replaced
 - `zb install` no longer upgrades dependencies that are already installed. Installing a package only installs the dependencies that are missing, and `zb upgrade <pkg>` only upgrades the package you name. Use `zb upgrade` to bring everything up to date

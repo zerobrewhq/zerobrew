@@ -204,6 +204,8 @@ Measured on 2026-09-30 with zerobrew 0.3.3 and Homebrew 7.0.7 on macOS 26.6.2, M
 
 To reproduce, run `just bench --full results/` on a machine with nothing installed in Homebrew. It resets zerobrew, uninstalls everything it installed in Homebrew, and writes a README-ready table to `results/benchmark.md`.
 
+A smaller version runs in CI every night and on every change to the install code: the [parity workflow](https://github.com/zerobrewhq/zerobrew/actions/workflows/parity.yml) installs a fixed set of formulae cold with both tools on the same runner, compares the resulting prefixes byte for byte, and fails if zerobrew is less than 1.5x faster on any of them. The per-run numbers are in each run's summary.
+
 ## Relationship with Homebrew
 
 zerobrew is more of a performance-optimized client for the Homebrew ecosystem. We rely on:
