@@ -561,6 +561,9 @@ bench *args:
         remove_brew_bench_formulae
         clear_brew_downloads
         zb reset -y &>/dev/null || true
+        # Homebrew's formula index was loaded once above and is kept; give
+        # zerobrew its index untimed too, so cold times only the install.
+        zb update &>/dev/null || true
 
         BREW_COLD_MS=$(run_timed_install "Homebrew (cold)" brew install --formula "$pkg") || { record_failure "$pkg" "brew install failed (cold)"; continue; }
         remove_brew_bench_formulae
