@@ -336,16 +336,17 @@ fn change_with_install_name_tool(path: &Path, changes: &[UnfitChange]) -> Result
 }
 
 /// Ad-hoc sign files whose signature was invalidated by patching, keeping
-/// their entitlements, requirements, flags and hardened runtime. One
-/// `codesign` run signs a whole batch; if that fails, each file is signed on
+/// their entitlements, requirements, flags and hardened runtime. Signing is
+/// mostly hashing, so the files are split into batches signed in parallel,
+/// one `codesign` run each. If a batch fails, each of its files is signed on
 /// its own so the one at fault can be reported. A file that still fails is
 /// retried once on a fresh copy, which is how Homebrew works around a
 /// codesign bug.
 fn sign(paths: &[&Path]) {
-    const BATCH: usize = 200;
-    for batch in paths.chunks(BATCH) {
+    const BATCH: usize = 16;
+    paths.par_chunks(BATCH).for_each(|batch| {
         if codesign(batch).is_ok() {
-            continue;
+            return;
         }
         for path in batch {
             if let Err(e) = codesign(&[path]).or_else(|_| resign_fresh_copy(path)) {
@@ -356,7 +357,7 @@ fn sign(paths: &[&Path]) {
                 );
             }
         }
-    }
+    });
 }
 
 fn codesign(paths: &[&Path]) -> Result<(), String> {
