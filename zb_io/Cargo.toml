@@ -9,6 +9,7 @@ flate2.workspace = true
 futures.workspace = true
 libc.workspace = true
 memchr.workspace = true
+bytes.workspace = true
 futures-util.workspace = true
 rayon.workspace = true
 regex.workspace = true
