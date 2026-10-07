@@ -2,14 +2,12 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use futures_util::future::select_all;
-use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH};
+use reqwest::header::CONTENT_LENGTH;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Notify, RwLock, Semaphore};
+use tokio::sync::RwLock;
 use tracing::warn;
 
 use crate::network::tls::shared_tls_config;
@@ -17,13 +15,9 @@ use crate::progress::InstallProgress;
 use crate::storage::blob::BlobCache;
 use zb_core::Error;
 
-use super::auth::{
-    TokenCache, bearer_header, fetch_download_response_internal, get_cached_token_for_url_internal,
-};
-use super::chunked::{ChunkedDownloadContext, download_with_chunks, server_supports_ranges};
+use super::auth::{TokenCache, TokenEndpoint, fetch_download_response_internal, prefetch_tokens};
 use super::{
-    CHUNKED_DOWNLOAD_THRESHOLD, DownloadProgressCallback, GLOBAL_DOWNLOAD_CONCURRENCY,
-    RACING_CONNECTIONS, RACING_STAGGER_MS,
+    DownloadError, DownloadProgressCallback, GLOBAL_DOWNLOAD_CONCURRENCY, MAX_DOWNLOAD_ATTEMPTS,
 };
 
 fn get_alternate_urls(primary_url: &str) -> Vec<String> {
@@ -51,26 +45,24 @@ fn transform_url_to_mirror(url: &str, mirror_domain: &str) -> Option<String> {
     }
 }
 
+/// Downloads bottles into the blob cache over one connection pool. Every
+/// request reuses the registry and CDN connections of the ones before it,
+/// and registry tokens are fetched up front for a whole plan where the
+/// registry is known; see [`Downloader::prefetch_tokens`].
 pub struct Downloader {
     client: reqwest::Client,
     pub(crate) blob_cache: BlobCache,
-    pub(crate) token_cache: TokenCache,
-    pub(crate) global_semaphore: Option<Arc<Semaphore>>,
-    tls_config: Arc<rustls::ClientConfig>,
+    token_cache: TokenCache,
+    token_endpoints: HashMap<String, TokenEndpoint>,
 }
 
 impl Downloader {
     pub fn new(blob_cache: BlobCache) -> Self {
-        Self::with_semaphore(blob_cache, None)
-    }
-
-    pub fn with_semaphore(blob_cache: BlobCache, semaphore: Option<Arc<Semaphore>>) -> Self {
-        let tls_config = shared_tls_config();
-
         let client = reqwest::Client::builder()
             .user_agent("zerobrew/0.1")
-            .use_preconfigured_tls((*tls_config).clone())
-            .pool_max_idle_per_host(10)
+            .use_preconfigured_tls((*shared_tls_config()).clone())
+            .pool_max_idle_per_host(GLOBAL_DOWNLOAD_CONCURRENCY)
+            .pool_idle_timeout(Duration::from_secs(90))
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(60))
             .connect_timeout(Duration::from_secs(30))
@@ -85,29 +77,25 @@ impl Downloader {
             client,
             blob_cache,
             token_cache: Arc::new(RwLock::new(HashMap::new())),
-            global_semaphore: semaphore,
-            tls_config,
+            token_endpoints: TokenEndpoint::known(),
         }
     }
 
-    fn create_isolated_client(&self) -> reqwest::Client {
-        reqwest::Client::builder()
-            .user_agent("zerobrew/0.1")
-            .use_preconfigured_tls((*self.tls_config).clone())
-            .pool_max_idle_per_host(0)
-            .tcp_nodelay(true)
-            .tcp_keepalive(Duration::from_secs(60))
-            .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(300))
-            .http2_adaptive_window(true)
-            .http2_initial_stream_window_size(Some(2 * 1024 * 1024))
-            .http2_initial_connection_window_size(Some(4 * 1024 * 1024))
-            .build()
-            .expect("failed to build isolated HTTP client")
+    /// Treat `host` as a registry handing out tokens at `endpoint`.
+    #[cfg(test)]
+    pub(crate) fn with_token_endpoint(mut self, host: &str, endpoint: TokenEndpoint) -> Self {
+        self.token_endpoints.insert(host.to_string(), endpoint);
+        self
     }
 
     pub fn remove_blob(&self, sha256: &str) -> bool {
         self.blob_cache.remove_blob(sha256).unwrap_or(false)
+    }
+
+    /// Fetch one registry token covering every blob in `urls` before they
+    /// are downloaded, so none of them pays the 401 round trip.
+    pub(crate) async fn prefetch_tokens(&self, urls: &[String]) {
+        prefetch_tokens(&self.client, &self.token_cache, &self.token_endpoints, urls).await;
     }
 
     pub async fn download(&self, url: &str, expected_sha256: &str) -> Result<PathBuf, Error> {
@@ -132,213 +120,47 @@ impl Downloader {
             return Ok(self.blob_cache.blob_path(expected_sha256));
         }
 
-        let alternates = get_alternate_urls(url);
-
-        self.download_with_racing(url, &alternates, expected_sha256, name, progress)
+        let mut urls = vec![url.to_string()];
+        urls.extend(get_alternate_urls(url));
+        self.download_from(&urls, expected_sha256, name, progress)
             .await
     }
 
-    async fn download_with_racing(
+    /// Download from the first of `urls` that works. Each URL gets up to
+    /// [`MAX_DOWNLOAD_ATTEMPTS`] tries with backoff while its failures look
+    /// transient; a final failure moves on to the next URL.
+    async fn download_from(
         &self,
-        primary_url: &str,
-        alternate_urls: &[String],
+        urls: &[String],
         expected_sha256: &str,
         name: Option<String>,
         progress: Option<DownloadProgressCallback>,
     ) -> Result<PathBuf, Error> {
-        let (use_chunked, file_size) = {
-            let cached_token =
-                get_cached_token_for_url_internal(&self.token_cache, primary_url).await;
-
-            let mut request = self.client.head(primary_url);
-            if let Some(token) = &cached_token {
-                request = request.header(AUTHORIZATION, bearer_header(token)?);
-            }
-
-            match request.send().await {
-                Ok(response) if response.status().is_success() => {
-                    let content_length = response
-                        .headers()
-                        .get(CONTENT_LENGTH)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok());
-
-                    let supports_ranges = server_supports_ranges(&response);
-
-                    if let Some(size) = content_length {
-                        (
-                            supports_ranges && size >= CHUNKED_DOWNLOAD_THRESHOLD,
-                            Some(size),
-                        )
-                    } else {
-                        (false, None)
-                    }
-                }
-                _ => (false, None),
-            }
-        };
-
-        if use_chunked && let Some(size) = file_size {
-            let semaphore = self
-                .global_semaphore
-                .clone()
-                .unwrap_or_else(|| Arc::new(Semaphore::new(GLOBAL_DOWNLOAD_CONCURRENCY)));
-
-            let mut all_urls = Vec::new();
-            all_urls.push(primary_url.to_string());
-            all_urls.extend(alternate_urls.iter().cloned());
-
-            let mut last_error = None;
-            for url in &all_urls {
-                let ctx = ChunkedDownloadContext {
-                    blob_cache: &self.blob_cache,
-                    client: &self.client,
-                    token_cache: &self.token_cache,
-                    url: url.as_str(),
-                    expected_sha256,
-                    name: name.clone(),
-                    progress: progress.clone(),
-                    file_size: size,
-                    global_semaphore: &semaphore,
-                };
-
-                match download_with_chunks(&ctx).await {
-                    Ok(path) => return Ok(path),
-                    Err(err) => last_error = Some(err),
-                }
-            }
-
-            warn!(
-                error = %last_error
-                    .as_ref()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "unknown error".to_string()),
-                "chunked download failed; falling back to single-connection download"
-            );
-        }
-
-        let done = Arc::new(AtomicBool::new(false));
-        let done_notify = Arc::new(Notify::new());
-        let body_download_gate = Arc::new(Semaphore::new(1));
-
-        let mut all_urls: Vec<String> = Vec::new();
-
-        for _ in 0..RACING_CONNECTIONS {
-            all_urls.push(primary_url.to_string());
-        }
-
-        all_urls.extend(alternate_urls.iter().cloned());
-
-        let mut handles = Vec::new();
-        for (idx, url) in all_urls.into_iter().enumerate() {
-            let downloader_client = if idx < RACING_CONNECTIONS {
-                self.create_isolated_client()
-            } else {
-                self.client.clone()
-            };
-            let blob_cache = self.blob_cache.clone();
-            let token_cache = self.token_cache.clone();
-            let expected_sha256 = expected_sha256.to_string();
-            let name = name.clone();
-            let progress = progress.clone();
-            let done = done.clone();
-            let done_notify = done_notify.clone();
-            let body_download_gate = body_download_gate.clone();
-
-            let delay = Duration::from_millis(idx as u64 * RACING_STAGGER_MS);
-
-            let handle = tokio::spawn(async move {
-                tokio::time::sleep(delay).await;
-
-                if done.load(Ordering::Acquire) {
-                    return Err(Error::NetworkFailure {
-                        message: "cancelled: another download finished first".to_string(),
-                    });
-                }
-
-                if blob_cache.has_blob(&expected_sha256) {
-                    if let (Some(cb), Some(n)) = (&progress, &name) {
-                        cb(InstallProgress::DownloadCompleted {
-                            name: n.clone(),
-                            total_bytes: 0,
-                        });
-                    }
-
-                    done.store(true, Ordering::Release);
-                    done_notify.notify_waiters();
-                    return Ok(blob_cache.blob_path(&expected_sha256));
-                }
-
-                let response =
-                    fetch_download_response_internal(&downloader_client, &token_cache, &url)
-                        .await?;
-
-                let _permit = tokio::select! {
-                    permit = body_download_gate.acquire_owned() => permit.map_err(|_| Error::NetworkFailure {
-                        message: "download permit closed unexpectedly".to_string(),
-                    })?,
-                    _ = done_notify.notified() => {
-                        return Err(Error::NetworkFailure {
-                            message: "cancelled: another download finished first".to_string(),
-                        });
-                    }
-                };
-
-                if done.load(Ordering::Acquire) {
-                    return Err(Error::NetworkFailure {
-                        message: "cancelled: another download finished first".to_string(),
-                    });
-                }
-
-                if blob_cache.has_blob(&expected_sha256) {
-                    if let (Some(cb), Some(n)) = (&progress, &name) {
-                        cb(InstallProgress::DownloadCompleted {
-                            name: n.clone(),
-                            total_bytes: 0,
-                        });
-                    }
-
-                    done.store(true, Ordering::Release);
-                    done_notify.notify_waiters();
-                    return Ok(blob_cache.blob_path(&expected_sha256));
-                }
-
-                let result = download_response_internal(
-                    &blob_cache,
-                    response,
-                    &expected_sha256,
-                    name,
-                    progress,
-                )
-                .await;
-
-                if result.is_ok() {
-                    done.store(true, Ordering::Release);
-                    done_notify.notify_waiters();
-                }
-
-                result
-            });
-
-            handles.push(handle);
-        }
-
-        let mut pending = handles;
         let mut last_error = None;
 
-        while !pending.is_empty() {
-            let (result, _index, remaining) = select_all(pending).await;
-            pending = remaining;
-
-            match result {
-                Ok(Ok(path)) => {
-                    for handle in &pending {
-                        handle.abort();
+        for url in urls {
+            for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
+                match self
+                    .download_once(url, expected_sha256, name.clone(), progress.clone())
+                    .await
+                {
+                    Ok(path) => return Ok(path),
+                    Err(DownloadError { error, transient }) => {
+                        let retry = transient && attempt < MAX_DOWNLOAD_ATTEMPTS;
+                        warn!(
+                            url,
+                            attempt,
+                            error = %error,
+                            retry,
+                            "download attempt failed"
+                        );
+                        last_error = Some(error);
+                        if !retry {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(250 << (attempt - 1))).await;
                     }
-                    return Ok(path);
                 }
-                Ok(Err(e)) => last_error = Some(e),
-                Err(e) => last_error = Some(Error::network("task join error")(e)),
             }
         }
 
@@ -346,15 +168,29 @@ impl Downloader {
             message: "all download attempts failed".to_string(),
         }))
     }
+
+    async fn download_once(
+        &self,
+        url: &str,
+        expected_sha256: &str,
+        name: Option<String>,
+        progress: Option<DownloadProgressCallback>,
+    ) -> Result<PathBuf, DownloadError> {
+        let response =
+            fetch_download_response_internal(&self.client, &self.token_cache, url).await?;
+        download_response_internal(&self.blob_cache, response, expected_sha256, name, progress)
+            .await
+    }
 }
 
-pub(crate) async fn download_response_internal(
+/// Stream a response into the blob cache, verifying its checksum.
+async fn download_response_internal(
     blob_cache: &BlobCache,
     response: reqwest::Response,
     expected_sha256: &str,
     name: Option<String>,
     progress: Option<DownloadProgressCallback>,
-) -> Result<PathBuf, Error> {
+) -> Result<PathBuf, DownloadError> {
     let total_bytes = response
         .headers()
         .get(CONTENT_LENGTH)
@@ -370,20 +206,22 @@ pub(crate) async fn download_response_internal(
 
     let mut writer = blob_cache
         .start_write(expected_sha256)
-        .map_err(Error::network("failed to create blob writer"))?;
+        .map_err(|e| DownloadError::permanent(Error::network("failed to create blob writer")(e)))?;
 
     let mut hasher = Sha256::new();
     let mut stream = response.bytes_stream();
     let mut downloaded: u64 = 0;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(Error::network("failed to read chunk"))?;
+        // A connection dropped mid-body; the next attempt starts over.
+        let chunk = chunk
+            .map_err(|e| DownloadError::transient(Error::network("failed to read chunk")(e)))?;
 
         downloaded += chunk.len() as u64;
         hasher.update(&chunk);
         writer
             .write_all(&chunk)
-            .map_err(Error::network("failed to write chunk"))?;
+            .map_err(|e| DownloadError::permanent(Error::network("failed to write chunk")(e)))?;
 
         if let (Some(cb), Some(n)) = (&progress, &name) {
             cb(InstallProgress::DownloadProgress {
@@ -397,15 +235,17 @@ pub(crate) async fn download_response_internal(
     let actual_hash = crate::checksum::sha256_hex(hasher);
 
     if actual_hash != expected_sha256 {
-        return Err(Error::ChecksumMismatch {
+        // Most often a truncated or mangled transfer; the next attempt may
+        // get the real thing.
+        return Err(DownloadError::transient(Error::ChecksumMismatch {
             expected: expected_sha256.to_string(),
             actual: actual_hash,
-        });
+        }));
     }
 
     writer
         .flush()
-        .map_err(Error::network("failed to flush download"))?;
+        .map_err(|e| DownloadError::permanent(Error::network("failed to flush download")(e)))?;
 
     if let (Some(cb), Some(n)) = (&progress, &name) {
         cb(InstallProgress::DownloadCompleted {
@@ -414,21 +254,27 @@ pub(crate) async fn download_response_internal(
         });
     }
 
-    writer.commit()
+    writer.commit().map_err(DownloadError::permanent)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::matchers::{header_exists, method, path, query_param};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    const HELLO_SHA: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+
+    fn downloader(tmp: &TempDir) -> Downloader {
+        Downloader::new(BlobCache::new(tmp.path()).unwrap())
+    }
 
     #[tokio::test]
     async fn valid_checksum_passes() {
         let mock_server = MockServer::start().await;
         let content = b"hello world";
-        let sha256 = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
 
         Mock::given(method("GET"))
             .and(path("/test.tar.gz"))
@@ -437,11 +283,10 @@ mod tests {
             .await;
 
         let tmp = TempDir::new().unwrap();
-        let blob_cache = BlobCache::new(tmp.path()).unwrap();
-        let downloader = Downloader::new(blob_cache);
+        let downloader = downloader(&tmp);
 
         let url = format!("{}/test.tar.gz", mock_server.uri());
-        let result = downloader.download(&url, sha256).await;
+        let result = downloader.download(&url, HELLO_SHA).await;
 
         assert!(result.is_ok());
         let blob_path = result.unwrap();
@@ -458,12 +303,12 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/test.tar.gz"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
+            .expect(MAX_DOWNLOAD_ATTEMPTS as u64)
             .mount(&mock_server)
             .await;
 
         let tmp = TempDir::new().unwrap();
-        let blob_cache = BlobCache::new(tmp.path()).unwrap();
-        let downloader = Downloader::new(blob_cache);
+        let downloader = downloader(&tmp);
 
         let url = format!("{}/test.tar.gz", mock_server.uri());
         let result = downloader.download(&url, wrong_sha256).await;
@@ -489,7 +334,6 @@ mod tests {
     async fn skips_download_if_blob_exists() {
         let mock_server = MockServer::start().await;
         let content = b"hello world";
-        let sha256 = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
 
         Mock::given(method("GET"))
             .and(path("/test.tar.gz"))
@@ -501,14 +345,230 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let blob_cache = BlobCache::new(tmp.path()).unwrap();
 
-        let mut writer = blob_cache.start_write(sha256).unwrap();
+        let mut writer = blob_cache.start_write(HELLO_SHA).unwrap();
         writer.write_all(content).unwrap();
         writer.commit().unwrap();
 
         let downloader = Downloader::new(blob_cache);
         let url = format!("{}/test.tar.gz", mock_server.uri());
-        let result = downloader.download(&url, sha256).await;
+        let result = downloader.download(&url, HELLO_SHA).await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn retries_a_server_error_and_then_succeeds() {
+        let mock_server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+
+        Mock::given(method("GET"))
+            .and(path("/flaky.tar.gz"))
+            .respond_with(move |_: &Request| {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(503)
+                } else {
+                    ResponseTemplate::new(200).set_body_bytes(b"hello world".to_vec())
+                }
+            })
+            .mount(&mock_server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let url = format!("{}/flaky.tar.gz", mock_server.uri());
+        let path = downloader(&tmp).download(&url, HELLO_SHA).await.unwrap();
+
+        assert!(path.exists());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_client_error_is_not_retried() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/missing.tar.gz"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let url = format!("{}/missing.tar.gz", mock_server.uri());
+        let err = downloader(&tmp)
+            .download(&url, HELLO_SHA)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("HTTP 404"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_the_next_url_after_the_first_gives_up() {
+        let primary = MockServer::start().await;
+        let mirror = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/x.tar.gz"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(MAX_DOWNLOAD_ATTEMPTS as u64)
+            .mount(&primary)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/x.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello world".to_vec()))
+            .expect(1)
+            .mount(&mirror)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let urls = [
+            format!("{}/x.tar.gz", primary.uri()),
+            format!("{}/x.tar.gz", mirror.uri()),
+        ];
+        let path = downloader(&tmp)
+            .download_from(&urls, HELLO_SHA, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(path).unwrap(), b"hello world");
+    }
+
+    /// A registry that demands a token: anonymous requests get a challenge.
+    async fn registry(server: &MockServer, blob_path: &str) {
+        Mock::given(method("GET"))
+            .and(path(blob_path))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello world".to_vec()))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(blob_path))
+            .respond_with(ResponseTemplate::new(401).append_header(
+                "WWW-Authenticate",
+                format!(
+                    "Bearer realm=\"{}/token\",service=\"test\",scope=\"repository:homebrew/core/x:pull\"",
+                    server.uri()
+                ),
+            ))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn answers_a_401_challenge_with_a_token() {
+        let server = MockServer::start().await;
+        registry(&server, "/v2/homebrew/core/x/blobs/sha256:abc").await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(query_param("service", "test"))
+            .and(query_param("scope", "repository:homebrew/core/x:pull"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "test-token-12345"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let downloader = downloader(&tmp);
+        let url = format!("{}/v2/homebrew/core/x/blobs/sha256:abc", server.uri());
+
+        let path = downloader.download(&url, HELLO_SHA).await.unwrap();
+        assert!(path.exists());
+
+        // The token is cached for the scope: a second blob of the same
+        // formula needs no challenge.
+        downloader.remove_blob(HELLO_SHA);
+        downloader.download(&url, HELLO_SHA).await.unwrap();
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path().contains("/blobs/"))
+                .count(),
+            3,
+            "challenge, authenticated GET, then one authenticated GET"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetches_one_token_for_every_blob_of_a_known_registry() {
+        let server = MockServer::start().await;
+        for name in ["a", "b", "c"] {
+            registry(
+                &server,
+                &format!("/v2/homebrew/core/{name}/blobs/sha256:abc"),
+            )
+            .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(query_param("scope", "repository:homebrew/core/a:pull"))
+            .and(query_param("scope", "repository:homebrew/core/b:pull"))
+            .and(query_param("scope", "repository:homebrew/core/c:pull"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "shared-token",
+                "expires_in": 300
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let host = server.uri().trim_start_matches("http://").to_string();
+        let tmp = TempDir::new().unwrap();
+        let downloader = downloader(&tmp).with_token_endpoint(
+            &host,
+            TokenEndpoint {
+                realm: format!("{}/token", server.uri()),
+                service: "test".into(),
+            },
+        );
+        let urls: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|name| format!("{}/v2/homebrew/core/{name}/blobs/sha256:abc", server.uri()))
+            .collect();
+
+        downloader.prefetch_tokens(&urls).await;
+        for url in &urls {
+            downloader.download(url, HELLO_SHA).await.unwrap();
+            downloader.remove_blob(HELLO_SHA);
+        }
+
+        let challenged = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.url.path().contains("/blobs/") && !r.headers.contains_key("authorization")
+            })
+            .count();
+        assert_eq!(
+            challenged, 0,
+            "every blob GET carried the pre-fetched token"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetch_skips_unknown_registries_and_cached_scopes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let downloader = downloader(&tmp);
+        downloader
+            .prefetch_tokens(&[format!(
+                "{}/v2/homebrew/core/a/blobs/sha256:abc",
+                server.uri()
+            )])
+            .await;
     }
 }

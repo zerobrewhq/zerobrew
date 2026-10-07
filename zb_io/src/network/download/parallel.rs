@@ -26,27 +26,24 @@ pub struct ParallelDownloader {
 
 impl ParallelDownloader {
     pub fn new(blob_cache: BlobCache) -> Self {
-        let semaphore = Arc::new(Semaphore::new(GLOBAL_DOWNLOAD_CONCURRENCY));
+        Self::with_concurrency(blob_cache, GLOBAL_DOWNLOAD_CONCURRENCY)
+    }
+
+    pub fn with_concurrency(blob_cache: BlobCache, concurrency: usize) -> Self {
         Self {
-            downloader: Arc::new(Downloader::with_semaphore(
-                blob_cache,
-                Some(semaphore.clone()),
-            )),
-            semaphore,
+            downloader: Arc::new(Downloader::new(blob_cache)),
+            semaphore: Arc::new(Semaphore::new(concurrency)),
             inflight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn with_concurrency(blob_cache: BlobCache, concurrency: usize) -> Self {
-        let semaphore = Arc::new(Semaphore::new(concurrency));
-        Self {
-            downloader: Arc::new(Downloader::with_semaphore(
-                blob_cache,
-                Some(semaphore.clone()),
-            )),
-            semaphore,
-            inflight: Arc::new(Mutex::new(HashMap::new())),
-        }
+    /// The URLs in `requests` whose blobs are not cached yet.
+    fn missing_urls(&self, requests: &[DownloadRequest]) -> Vec<String> {
+        requests
+            .iter()
+            .filter(|req| !self.downloader.blob_cache.has_blob(&req.sha256))
+            .map(|req| req.url.clone())
+            .collect()
     }
 
     pub fn remove_blob(&self, sha256: &str) -> bool {
@@ -80,6 +77,9 @@ impl ParallelDownloader {
         requests: Vec<DownloadRequest>,
         progress: Option<DownloadProgressCallback>,
     ) -> Result<Vec<PathBuf>, Error> {
+        self.downloader
+            .prefetch_tokens(&self.missing_urls(&requests))
+            .await;
         let handles: Vec<_> = requests
             .into_iter()
             .map(|req| {
@@ -109,29 +109,39 @@ impl ParallelDownloader {
         progress: Option<DownloadProgressCallback>,
     ) -> mpsc::Receiver<Result<DownloadResult, Error>> {
         let (tx, rx) = mpsc::channel(requests.len().max(1));
+        let missing = self.missing_urls(&requests);
+        let downloader = self.downloader.clone();
+        let semaphore = self.semaphore.clone();
+        let inflight = self.inflight.clone();
 
-        for (index, req) in requests.into_iter().enumerate() {
-            let downloader = self.downloader.clone();
-            let semaphore = self.semaphore.clone();
-            let inflight = self.inflight.clone();
-            let progress = progress.clone();
-            let tx = tx.clone();
-            let name = req.name.clone();
-            let sha256 = req.sha256.clone();
+        tokio::spawn(async move {
+            // One token for the whole plan before the first bottle request.
+            downloader.prefetch_tokens(&missing).await;
 
-            tokio::spawn(async move {
-                let result =
-                    Self::download_with_dedup(downloader, semaphore, inflight, req, progress).await;
-                let _ = tx
-                    .send(result.map(|blob_path| DownloadResult {
-                        name,
-                        sha256,
-                        blob_path,
-                        index,
-                    }))
-                    .await;
-            });
-        }
+            for (index, req) in requests.into_iter().enumerate() {
+                let downloader = downloader.clone();
+                let semaphore = semaphore.clone();
+                let inflight = inflight.clone();
+                let progress = progress.clone();
+                let tx = tx.clone();
+                let name = req.name.clone();
+                let sha256 = req.sha256.clone();
+
+                tokio::spawn(async move {
+                    let result =
+                        Self::download_with_dedup(downloader, semaphore, inflight, req, progress)
+                            .await;
+                    let _ = tx
+                        .send(result.map(|blob_path| DownloadResult {
+                            name,
+                            sha256,
+                            blob_path,
+                            index,
+                        }))
+                        .await;
+                });
+            }
+        });
 
         rx
     }
