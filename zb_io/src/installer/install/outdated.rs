@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use zb_core::{Error, select_bottle};
 
 use super::{Installer, OutdatedPackage};
@@ -50,40 +48,17 @@ impl Installer {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        let installed_names: std::collections::HashSet<&str> =
-            installed.iter().map(|k| k.name.as_str()).collect();
-
-        let bulk_raw = self.api_client.get_all_formulas_raw().await?;
-        let bulk_values: Vec<serde_json::Value> = serde_json::from_str(&bulk_raw)
-            .map_err(Error::network("failed to parse bulk formula JSON"))?;
-
-        let mut bulk_map: HashMap<String, zb_core::Formula> = HashMap::new();
-        for val in bulk_values {
-            let name = match val.get("name").and_then(|n| n.as_str()) {
-                Some(n) if installed_names.contains(n) => n.to_string(),
-                _ => continue,
-            };
-            if let Ok(f) = serde_json::from_value(val) {
-                bulk_map.insert(name, f);
-            }
-        }
-
+        // Core formulas come from the local index; tap formulas are fetched.
         let mut outdated = Vec::new();
         let mut warnings = Vec::new();
 
         for keg in &installed {
-            let is_tap = keg.name.contains('/');
-
-            let formula = if is_tap || !bulk_map.contains_key(&keg.name) {
-                match self.api_client.get_formula(&keg.name).await {
-                    Ok(f) => f,
-                    Err(e) => {
-                        warnings.push(format!("{}: {}", keg.name, e));
-                        continue;
-                    }
+            let formula = match self.api_client.get_formula(&keg.name).await {
+                Ok(f) => f,
+                Err(e) => {
+                    warnings.push(format!("{}: {}", keg.name, e));
+                    continue;
                 }
-            } else {
-                bulk_map.remove(&keg.name).unwrap()
             };
 
             let is_source = keg.store_key.starts_with("source:");
@@ -174,8 +149,9 @@ mod tests {
         let prefix = tmp.path().join("homebrew");
         fs::create_dir_all(root.join("db")).unwrap();
 
-        let api_client =
-            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
+        let api_client = ApiClient::with_base_url(format!("{}/formula", mock_server.uri()))
+            .unwrap()
+            .with_cache(crate::network::cache::ApiCache::in_memory().unwrap());
         let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
         let store = Store::new(&root).unwrap();
         let cellar = Cellar::new(&root).unwrap();

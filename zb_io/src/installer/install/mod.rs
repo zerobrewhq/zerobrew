@@ -114,8 +114,12 @@ impl Installer {
         }
     }
 
-    pub fn clear_api_cache(&self) -> Result<usize, Error> {
-        self.api_client.clear_cache()
+    /// Fetch the formula index again and drop cached API responses.
+    /// Returns how many formulas the fresh index has.
+    pub async fn update_api_cache(&self) -> Result<usize, Error> {
+        self.api_client.clear_cache()?;
+        self.api_client.refresh_index(true).await?;
+        Ok(self.api_client.index_len())
     }
 
     pub async fn execute(&mut self, plan: InstallPlan, link: bool) -> Result<ExecuteResult, Error> {

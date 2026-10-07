@@ -9,12 +9,12 @@ rust-version = "1.96"
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "process"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 console = "0.16.2"
 indicatif = "0.18.3"
-reqwest = { version = "0.13.1", default-features = false, features = ["json", "stream", "rustls", "http2"] }
+reqwest = { version = "0.13.1", default-features = false, features = ["json", "stream", "rustls", "http2", "gzip"] }
 # Pinned to 0.23.x: newer reqwest pulls rustls 0.24-dev, which lacks the aws-lc-rs feature.
 rustls = { version = ">=0.23.43, <0.24", features = ["aws-lc-rs"] }
 rustls-native-certs = "0.8.3"

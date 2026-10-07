@@ -1,17 +1,12 @@
 use console::style;
 
-pub fn execute(installer: &mut zb_io::Installer) -> Result<(), zb_core::Error> {
-    let removed = installer.clear_api_cache()?;
-    if removed == 0 {
-        println!("{} No cached entries to clear.", style("==>").cyan().bold());
-    } else {
-        println!(
-            "{} Cleared {} cached formula {}.",
-            style("==>").cyan().bold(),
-            style(removed).green().bold(),
-            if removed == 1 { "entry" } else { "entries" }
-        );
-    }
+pub async fn execute(installer: &mut zb_io::Installer) -> Result<(), zb_core::Error> {
+    let formulas = installer.update_api_cache().await?;
+    println!(
+        "{} Refreshed the formula index: {} formulas.",
+        style("==>").cyan().bold(),
+        style(formulas).green().bold()
+    );
     println!(
         "{}",
         style("Run `zb outdated` to check package updates.").dim()

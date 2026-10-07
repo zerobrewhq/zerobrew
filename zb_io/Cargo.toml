@@ -40,7 +40,7 @@ android-support = ["reqwest/native-tls"]
 reqwest = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
-reqwest = { version = "0.13.1", default-features = false, features = ["json", "stream", "http2"] }
+reqwest = { version = "0.13.1", default-features = false, features = ["json", "stream", "http2", "gzip"] }
 
 [dev-dependencies]
 tempfile.workspace = true

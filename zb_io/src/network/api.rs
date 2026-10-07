@@ -1,12 +1,76 @@
-use std::collections::HashMap;
+use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::checksum::verify_sha256_bytes;
-use crate::network::cache::{ApiCache, CacheEntry};
+use crate::network::cache::{ApiCache, CacheEntry, IndexEntry, IndexMeta};
 use crate::network::suggest::rank_formula_suggestions;
 use crate::network::tap_formula::{parse_tap_formula_ref, parse_tap_formula_ruby};
 use futures_util::stream::{self, StreamExt};
+use serde_json::value::RawValue;
+use tokio::sync::OnceCell;
+use tracing::{debug, warn};
 use zb_core::{Error, Formula};
+
+/// How long the formula index is trusted before it is revalidated, unless
+/// `ZEROBREW_API_AUTO_UPDATE_SECS` says otherwise. Matches the API's own
+/// `max-age`.
+const INDEX_MAX_AGE: Duration = Duration::from_secs(600);
+
+/// The names in one entry of the bulk API file.
+#[derive(serde::Deserialize)]
+struct IndexNames<'a> {
+    #[serde(borrow, default)]
+    name: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    aliases: Vec<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    oldnames: Vec<Cow<'a, str>>,
+}
+
+/// Split the bulk API file into index entries without building a tree for
+/// its 30 MB: each formula's JSON is kept verbatim.
+fn index_entries(body: &str) -> Result<Vec<IndexEntry<'_>>, Error> {
+    let raws: Vec<&RawValue> =
+        serde_json::from_str(body).map_err(Error::network("failed to parse bulk formula JSON"))?;
+    Ok(raws
+        .into_iter()
+        .filter_map(|raw| {
+            let names: IndexNames = serde_json::from_str(raw.get()).ok()?;
+            let name = names.name?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let aliases = names
+                .aliases
+                .iter()
+                .chain(&names.oldnames)
+                .map(|alias| alias.trim().to_string())
+                .filter(|alias| !alias.is_empty() && *alias != name)
+                .collect();
+            Some(IndexEntry {
+                name,
+                body: raw.get(),
+                aliases,
+            })
+        })
+        .collect())
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn index_max_age() -> Duration {
+    std::env::var("ZEROBREW_API_AUTO_UPDATE_SECS")
+        .ok()
+        .and_then(|secs| secs.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(INDEX_MAX_AGE)
+}
 
 const HOMEBREW_CORE_RAW_BASE: &str =
     "https://raw.githubusercontent.com/Homebrew/homebrew-core/main";
@@ -58,16 +122,6 @@ enum CachedGetResult {
     Fresh(reqwest::Response),
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct FormulaSuggestionEntry {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    aliases: Vec<String>,
-    #[serde(default)]
-    oldnames: Vec<String>,
-}
-
 #[derive(Debug)]
 pub struct ApiClient {
     base_url: String,
@@ -75,8 +129,10 @@ pub struct ApiClient {
     tap_raw_base_url: String,
     client: reqwest::Client,
     cache: Option<ApiCache>,
+    /// Whether the index in `cache` is usable this run, decided by the first
+    /// caller that needs it; see [`ApiClient::ensure_index`].
+    index_usable: OnceCell<bool>,
     formula_candidates: RwLock<Option<Arc<[String]>>>,
-    alias_map: RwLock<Option<Arc<HashMap<String, String>>>>,
 }
 
 impl ApiClient {
@@ -122,8 +178,8 @@ impl ApiClient {
             tap_raw_base_url: "https://raw.githubusercontent.com".to_string(),
             client,
             cache: None,
+            index_usable: OnceCell::new(),
             formula_candidates: RwLock::new(None),
-            alias_map: RwLock::new(None),
         }
     }
 
@@ -281,6 +337,9 @@ impl ApiClient {
         }
     }
 
+    /// Look a formula up in the index, then by alias, then on the API. A
+    /// name the index does not have may be newer than the index, so it is
+    /// still asked for; a 404 there is final.
     pub async fn get_formula(&self, name: &str) -> Result<Formula, Error> {
         if let Some(spec) = parse_tap_formula_ref(name) {
             return self.get_tap_formula(&spec).await;
@@ -290,21 +349,26 @@ impl ApiClient {
             serde_json::from_str(&body).map_err(Error::network("failed to parse formula JSON"))
         };
 
-        match self.fetch_formula_json(name).await {
-            Ok(body) => parse_body(body),
-            Err(Error::MissingFormula { .. }) => {
-                if let Ok(alias_map) = self.get_alias_map().await
-                    && let Some(canonical) = alias_map.get(name)
-                {
-                    return self
-                        .fetch_formula_json(canonical)
-                        .await
-                        .and_then(parse_body);
-                }
-                Err(Error::MissingFormula {
-                    name: name.to_string(),
-                })
+        let mut lookup = name.to_string();
+        if self.ensure_index().await
+            && let Some(cache) = &self.cache
+        {
+            if let Some(body) = cache.index_formula(name) {
+                return parse_body(body);
             }
+            if let Some(canonical) = cache.index_alias(name) {
+                if let Some(body) = cache.index_formula(&canonical) {
+                    return parse_body(body);
+                }
+                lookup = canonical;
+            }
+        }
+
+        match self.fetch_formula_json(&lookup).await {
+            Ok(body) => parse_body(body),
+            Err(Error::MissingFormula { .. }) => Err(Error::MissingFormula {
+                name: name.to_string(),
+            }),
             Err(e) => Err(e),
         }
     }
@@ -348,38 +412,108 @@ impl ApiClient {
         }
     }
 
-    pub async fn get_all_formulas_raw(&self) -> Result<String, Error> {
-        let url = format!("{}.json", self.base_url);
+    fn index_url(&self) -> String {
+        format!("{}.json", self.base_url)
+    }
 
-        match self.cached_get(&url).await? {
-            CachedGetResult::Cached(body) => Ok(body),
-            CachedGetResult::Fresh(response) => {
-                if !response.status().is_success() {
-                    return Err(Error::NetworkFailure {
-                        message: format!("bulk formula fetch returned HTTP {}", response.status()),
-                    });
+    /// Whether the index can serve lookups this run. The first caller
+    /// revalidates it when it is older than the max age; a failure there
+    /// keeps whatever index exists, and without any index every lookup goes
+    /// to the API as before.
+    async fn ensure_index(&self) -> bool {
+        *self
+            .index_usable
+            .get_or_init(|| async {
+                let Some(cache) = &self.cache else {
+                    return false;
+                };
+                match self.refresh_index(false).await {
+                    Ok(()) => cache.index_meta().is_some(),
+                    Err(e) => {
+                        if cache.index_meta().is_some() {
+                            warn!(error = %e, "could not refresh the formula index; using the cached one");
+                            true
+                        } else {
+                            debug!(error = %e, "no formula index available; fetching formulas one by one");
+                            false
+                        }
+                    }
                 }
+            })
+            .await
+    }
 
-                let etag = response
-                    .headers()
-                    .get("etag")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string());
-                let last_modified = response
-                    .headers()
-                    .get("last-modified")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string());
+    /// Bring the index up to date: a conditional GET of the bulk API file
+    /// when it is older than the max age, or always when `force` is set. A
+    /// 304 only bumps the timestamp; a 200 replaces the whole index.
+    pub async fn refresh_index(&self, force: bool) -> Result<(), Error> {
+        let Some(cache) = &self.cache else {
+            return Ok(());
+        };
+        let meta = cache.index_meta();
+        if !force
+            && let Some(meta) = &meta
+            && unix_now().saturating_sub(meta.fetched_at) < index_max_age().as_secs() as i64
+        {
+            return Ok(());
+        }
 
-                let body = response
-                    .text()
-                    .await
-                    .map_err(Error::network("failed to read bulk formula response body"))?;
-
-                self.store_response_in_cache(&url, etag, last_modified, &body);
-                Ok(body)
+        let url = self.index_url();
+        let mut request = self.client.get(&url);
+        if let Some(meta) = &meta {
+            if let Some(etag) = &meta.etag {
+                request = request.header("If-None-Match", etag.as_str());
+            }
+            if let Some(last_modified) = &meta.last_modified {
+                request = request.header("If-Modified-Since", last_modified.as_str());
             }
         }
+        let response = request.send().await.map_err(|e| Error::NetworkFailure {
+            message: e.to_string(),
+        })?;
+
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED && meta.is_some() {
+            cache
+                .touch_index(unix_now())
+                .map_err(Error::store("failed to update the formula index"))?;
+            debug!("formula index is current");
+            return Ok(());
+        }
+        if !response.status().is_success() {
+            return Err(Error::NetworkFailure {
+                message: format!("bulk formula fetch returned HTTP {}", response.status()),
+            });
+        }
+
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        };
+        let new_meta = IndexMeta {
+            etag: header("etag"),
+            last_modified: header("last-modified"),
+            fetched_at: unix_now(),
+        };
+        let body = response
+            .text()
+            .await
+            .map_err(Error::network("failed to read bulk formula response body"))?;
+        let count = cache
+            .replace_index(index_entries(&body)?, &new_meta)
+            .map_err(Error::store("failed to store the formula index"))?;
+        debug!(count, "formula index refreshed");
+        Ok(())
+    }
+
+    /// How many formulas the index holds.
+    pub fn index_len(&self) -> usize {
+        self.cache
+            .as_ref()
+            .and_then(|cache| cache.index_formula_count().ok())
+            .unwrap_or(0)
     }
 
     pub async fn suggest_formulas(&self, query: &str, limit: usize) -> Result<Vec<String>, Error> {
@@ -395,92 +529,46 @@ impl ApiClient {
         Ok(rank_formula_suggestions(query, &candidates, limit))
     }
 
+    /// Every formula name, alias and old name: from the index, or straight
+    /// from the bulk API file when there is no cache to index into.
     async fn formula_candidates(&self) -> Result<Arc<[String]>, Error> {
         if let Some(candidates) = self.formula_candidates.read().ok().and_then(|c| c.clone()) {
             return Ok(candidates);
         }
 
-        let raw = self.get_all_formulas_raw().await?;
-        let candidates: Arc<[String]> = Self::extract_formula_candidates(&raw)?.into();
+        let names: Vec<String> = match &self.cache {
+            Some(cache) if self.ensure_index().await => cache
+                .index_names()
+                .map_err(Error::store("failed to read the formula index"))?,
+            _ => {
+                let response = self
+                    .client
+                    .get(self.index_url())
+                    .send()
+                    .await
+                    .map_err(|e| Error::NetworkFailure {
+                        message: e.to_string(),
+                    })?;
+                if !response.status().is_success() {
+                    return Err(Error::NetworkFailure {
+                        message: format!("bulk formula fetch returned HTTP {}", response.status()),
+                    });
+                }
+                let body = response
+                    .text()
+                    .await
+                    .map_err(Error::network("failed to read bulk formula response body"))?;
+                index_entries(&body)?
+                    .into_iter()
+                    .flat_map(|entry| std::iter::once(entry.name).chain(entry.aliases))
+                    .collect()
+            }
+        };
+        let candidates: Arc<[String]> = names.into();
         if let Ok(mut cached) = self.formula_candidates.write() {
             *cached = Some(Arc::clone(&candidates));
         }
         Ok(candidates)
-    }
-
-    fn extract_formula_candidates(raw: &str) -> Result<Vec<String>, Error> {
-        use std::collections::HashSet;
-
-        let entries: Vec<FormulaSuggestionEntry> = serde_json::from_str(raw)
-            .map_err(Error::network("failed to parse bulk formula JSON"))?;
-
-        let mut seen = HashSet::new();
-        let mut candidates = Vec::new();
-
-        for entry in entries {
-            Self::push_candidate(&mut candidates, &mut seen, entry.name.as_deref());
-
-            for alias in &entry.aliases {
-                Self::push_candidate(&mut candidates, &mut seen, Some(alias.as_str()));
-            }
-
-            for oldname in &entry.oldnames {
-                Self::push_candidate(&mut candidates, &mut seen, Some(oldname.as_str()));
-            }
-        }
-
-        Ok(candidates)
-    }
-
-    fn push_candidate(
-        candidates: &mut Vec<String>,
-        seen: &mut std::collections::HashSet<String>,
-        value: Option<&str>,
-    ) {
-        let Some(name) = value.map(str::trim) else {
-            return;
-        };
-
-        if name.is_empty() {
-            return;
-        }
-
-        if seen.insert(name.to_string()) {
-            candidates.push(name.to_string());
-        }
-    }
-
-    async fn get_alias_map(&self) -> Result<Arc<HashMap<String, String>>, Error> {
-        if let Some(map) = self.alias_map.read().ok().and_then(|m| m.clone()) {
-            return Ok(map);
-        }
-
-        let raw = self.get_all_formulas_raw().await?;
-        let map: Arc<HashMap<String, String>> = Arc::new(Self::extract_alias_map(&raw)?);
-        if let Ok(mut cached) = self.alias_map.write() {
-            *cached = Some(Arc::clone(&map));
-        }
-        Ok(map)
-    }
-
-    fn extract_alias_map(raw: &str) -> Result<HashMap<String, String>, Error> {
-        let entries: Vec<FormulaSuggestionEntry> = serde_json::from_str(raw)
-            .map_err(Error::network("failed to parse bulk formula JSON"))?;
-
-        let mut map = HashMap::new();
-        for entry in &entries {
-            let Some(name) = entry.name.as_deref() else {
-                continue;
-            };
-            for alias in &entry.aliases {
-                map.entry(alias.clone()).or_insert_with(|| name.to_string());
-            }
-            for oldname in &entry.oldnames {
-                map.entry(oldname.clone())
-                    .or_insert_with(|| name.to_string());
-            }
-        }
-        Ok(map)
     }
 
     pub async fn get_cask(&self, token: &str) -> Result<serde_json::Value, Error> {
@@ -729,118 +817,6 @@ mod tests {
             err,
             Error::MissingFormula { name } if name == "nonexistent"
         ));
-    }
-
-    #[tokio::test]
-    async fn first_request_stores_etag() {
-        let mock_server = MockServer::start().await;
-        let fixture = include_str!("../../../zb_core/fixtures/formula_foo.json");
-
-        Mock::given(method("GET"))
-            .and(path("/foo.json"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(fixture)
-                    .insert_header("etag", "\"abc123\""),
-            )
-            .mount(&mock_server)
-            .await;
-
-        let cache = ApiCache::in_memory().unwrap();
-        let client = ApiClient::with_base_url(mock_server.uri())
-            .unwrap()
-            .with_cache(cache);
-
-        let _ = client.get_formula("foo").await.unwrap();
-
-        let cached = client
-            .cache
-            .as_ref()
-            .unwrap()
-            .get(&format!("{}/foo.json", mock_server.uri()))
-            .unwrap();
-        assert_eq!(cached.etag, Some("\"abc123\"".to_string()));
-    }
-
-    #[tokio::test]
-    async fn second_request_sends_if_none_match() {
-        let mock_server = MockServer::start().await;
-        let fixture = include_str!("../../../zb_core/fixtures/formula_foo.json");
-
-        // First request returns 200 with ETag
-        Mock::given(method("GET"))
-            .and(path("/foo.json"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(fixture)
-                    .insert_header("etag", "\"abc123\""),
-            )
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let cache = ApiCache::in_memory().unwrap();
-        let client = ApiClient::with_base_url(mock_server.uri())
-            .unwrap()
-            .with_cache(cache);
-
-        // First request
-        let _ = client.get_formula("foo").await.unwrap();
-
-        // Reset mocks for second request
-        mock_server.reset().await;
-
-        // Second request should send If-None-Match and receive 304
-        Mock::given(method("GET"))
-            .and(path("/foo.json"))
-            .and(header("If-None-Match", "\"abc123\""))
-            .respond_with(ResponseTemplate::new(304))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let formula = client.get_formula("foo").await.unwrap();
-        assert_eq!(formula.name, "foo");
-    }
-
-    #[tokio::test]
-    async fn uses_cached_body_on_304() {
-        let mock_server = MockServer::start().await;
-        let fixture = include_str!("../../../zb_core/fixtures/formula_foo.json");
-
-        // First request returns 200 with ETag
-        Mock::given(method("GET"))
-            .and(path("/foo.json"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(fixture)
-                    .insert_header("etag", "\"abc123\""),
-            )
-            .mount(&mock_server)
-            .await;
-
-        let cache = ApiCache::in_memory().unwrap();
-        let client = ApiClient::with_base_url(mock_server.uri())
-            .unwrap()
-            .with_cache(cache);
-
-        // First request populates cache
-        let _ = client.get_formula("foo").await.unwrap();
-
-        mock_server.reset().await;
-
-        // Second request returns 304 (no body)
-        Mock::given(method("GET"))
-            .and(path("/foo.json"))
-            .and(header("If-None-Match", "\"abc123\""))
-            .respond_with(ResponseTemplate::new(304))
-            .mount(&mock_server)
-            .await;
-
-        // Should return cached formula
-        let formula = client.get_formula("foo").await.unwrap();
-        assert_eq!(formula.name, "foo");
-        assert_eq!(formula.versions.stable, "1.2.3");
     }
 
     #[tokio::test]
@@ -1222,51 +1198,6 @@ end
     }
 
     #[tokio::test]
-    async fn get_all_formulas_raw_returns_bulk_json() {
-        let mock_server = MockServer::start().await;
-        let fixture = include_str!("../../../zb_core/fixtures/formula_foo.json");
-        let bulk_body = format!("[{}]", fixture);
-
-        Mock::given(method("GET"))
-            .and(path("/formula.json"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(&bulk_body))
-            .mount(&mock_server)
-            .await;
-
-        let client = ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
-        let raw = client.get_all_formulas_raw().await.unwrap();
-
-        let formulas: Vec<Formula> = serde_json::from_str(&raw).unwrap();
-        assert_eq!(formulas.len(), 1);
-        assert_eq!(formulas[0].name, "foo");
-        assert_eq!(formulas[0].versions.stable, "1.2.3");
-    }
-
-    #[test]
-    fn formula_suggestion_entry_defaults_optional_lists() {
-        let entry: FormulaSuggestionEntry = serde_json::from_str(r#"{"name":"python"}"#).unwrap();
-
-        assert_eq!(entry.name.as_deref(), Some("python"));
-        assert!(entry.aliases.is_empty());
-        assert!(entry.oldnames.is_empty());
-    }
-
-    #[test]
-    fn extract_formula_candidates_includes_name_aliases_and_oldnames() {
-        let bulk = r#"[
-            {"name":"python","aliases":["python@3.13"],"oldnames":["python3"]},
-            {"name":"ripgrep","aliases":["rg"]}
-        ]"#;
-
-        let candidates = ApiClient::extract_formula_candidates(bulk).unwrap();
-        assert!(candidates.contains(&"python".to_string()));
-        assert!(candidates.contains(&"python@3.13".to_string()));
-        assert!(candidates.contains(&"python3".to_string()));
-        assert!(candidates.contains(&"ripgrep".to_string()));
-        assert!(candidates.contains(&"rg".to_string()));
-    }
-
-    #[tokio::test]
     async fn suggest_formulas_returns_ranked_matches_from_bulk_index() {
         let mock_server = MockServer::start().await;
         let bulk = r#"[
@@ -1323,75 +1254,267 @@ end
         assert!(suggestions.is_empty());
     }
 
-    #[test]
-    fn extract_alias_map_maps_aliases_and_oldnames_to_canonical() {
-        let bulk = r#"[
-            {"name":"pkgconf","aliases":["pkg-config","pkgconfig"],"oldnames":[]},
-            {"name":"python","aliases":[],"oldnames":["python3"]}
-        ]"#;
+    fn bulk(entries: &[&str]) -> String {
+        format!("[{}]", entries.join(","))
+    }
 
-        let map = ApiClient::extract_alias_map(bulk).unwrap();
+    const FOO: &str = include_str!("../../../zb_core/fixtures/formula_foo.json");
 
-        assert_eq!(map.get("pkg-config").map(String::as_str), Some("pkgconf"));
-        assert_eq!(map.get("pkgconfig").map(String::as_str), Some("pkgconf"));
-        assert_eq!(map.get("python3").map(String::as_str), Some("python"));
-        assert!(!map.contains_key("pkgconf"));
-        assert!(!map.contains_key("python"));
+    /// A client whose cache is `cache`, pointed at `server`'s `/formula`.
+    fn indexed_client(server: &MockServer, cache: ApiCache) -> ApiClient {
+        ApiClient::with_base_url(format!("{}/formula", server.uri()))
+            .unwrap()
+            .with_cache(cache)
     }
 
     #[tokio::test]
-    async fn get_formula_resolves_alias_to_canonical_on_404() {
+    async fn formulas_are_served_from_the_index_without_a_request_each() {
         let mock_server = MockServer::start().await;
-        let fixture = include_str!("../../../zb_core/fixtures/formula_foo.json");
-        let bulk = r#"[{"name":"foo","aliases":["foo-alias"],"oldnames":[]}]"#;
-
         Mock::given(method("GET"))
             .and(path("/formula.json"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(bulk))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(bulk(&[FOO, r#"{"name":"bar","versions":{"stable":"2"},"dependencies":[],"bottle":{"stable":{"files":{}}}}"#]))
+                    .insert_header("etag", "\"abc123\""),
+            )
+            .expect(1)
             .mount(&mock_server)
             .await;
+        // No per-formula endpoint at all: lookups must come from the index.
 
-        Mock::given(method("GET"))
-            .and(path("/formula/foo-alias.json"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&mock_server)
-            .await;
+        let client = indexed_client(&mock_server, ApiCache::in_memory().unwrap());
+        let foo = client.get_formula("foo").await.unwrap();
+        let bar = client.get_formula("bar").await.unwrap();
 
-        Mock::given(method("GET"))
-            .and(path("/formula/foo.json"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(fixture))
-            .mount(&mock_server)
-            .await;
-
-        let client = ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
-        let formula = client.get_formula("foo-alias").await.unwrap();
-
-        assert_eq!(formula.name, "foo");
+        assert_eq!(foo.versions.stable, "1.2.3");
+        assert_eq!(bar.versions.stable, "2");
+        assert_eq!(client.index_len(), 2);
+        let meta = client.cache.as_ref().unwrap().index_meta().unwrap();
+        assert_eq!(meta.etag.as_deref(), Some("\"abc123\""));
     }
 
     #[tokio::test]
-    async fn get_formula_returns_missing_formula_when_alias_not_found() {
+    async fn a_fresh_index_is_not_revalidated() {
         let mock_server = MockServer::start().await;
-        let bulk = r#"[{"name":"pkgconf","aliases":["pkg-config"],"oldnames":[]}]"#;
-
         Mock::given(method("GET"))
             .and(path("/formula.json"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(bulk))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let cache = ApiCache::in_memory().unwrap();
+        cache
+            .replace_index(
+                index_entries(&bulk(&[FOO])).unwrap(),
+                &IndexMeta {
+                    etag: None,
+                    last_modified: None,
+                    fetched_at: unix_now(),
+                },
+            )
+            .unwrap();
+
+        let client = indexed_client(&mock_server, cache);
+        assert_eq!(client.get_formula("foo").await.unwrap().name, "foo");
+    }
+
+    #[tokio::test]
+    async fn a_stale_index_is_revalidated_and_kept_on_304() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/formula.json"))
+            .and(header("If-None-Match", "\"abc123\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let cache = ApiCache::in_memory().unwrap();
+        let stale = unix_now() - 24 * 3600;
+        cache
+            .replace_index(
+                index_entries(&bulk(&[FOO])).unwrap(),
+                &IndexMeta {
+                    etag: Some("\"abc123\"".into()),
+                    last_modified: None,
+                    fetched_at: stale,
+                },
+            )
+            .unwrap();
+
+        let client = indexed_client(&mock_server, cache);
+        assert_eq!(client.get_formula("foo").await.unwrap().name, "foo");
+        let meta = client.cache.as_ref().unwrap().index_meta().unwrap();
+        assert!(meta.fetched_at > stale, "304 must bump the timestamp");
+        assert_eq!(meta.etag.as_deref(), Some("\"abc123\""));
+    }
+
+    #[tokio::test]
+    async fn a_stale_index_is_replaced_on_200() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/formula.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(bulk(&[FOO])))
+            .mount(&mock_server)
+            .await;
+        let cache = ApiCache::in_memory().unwrap();
+        cache
+            .replace_index(
+                [IndexEntry {
+                    name: "gone".into(),
+                    body: r#"{"name":"gone"}"#,
+                    aliases: vec![],
+                }],
+                &IndexMeta {
+                    etag: None,
+                    last_modified: None,
+                    fetched_at: 0,
+                },
+            )
+            .unwrap();
+
+        let client = indexed_client(&mock_server, cache);
+        assert_eq!(client.get_formula("foo").await.unwrap().name, "foo");
+        assert!(
+            client
+                .cache
+                .as_ref()
+                .unwrap()
+                .index_formula("gone")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn aliases_resolve_through_the_index() {
+        let mock_server = MockServer::start().await;
+        let foo_with_alias = FOO.replacen(
+            "{",
+            r#"{"aliases":["foo-alias"],"oldnames":["old-foo"],"#,
+            1,
+        );
+        Mock::given(method("GET"))
+            .and(path("/formula.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(bulk(&[&foo_with_alias])))
             .mount(&mock_server)
             .await;
 
+        let client = indexed_client(&mock_server, ApiCache::in_memory().unwrap());
+        assert_eq!(client.get_formula("foo-alias").await.unwrap().name, "foo");
+        assert_eq!(client.get_formula("old-foo").await.unwrap().name, "foo");
+    }
+
+    #[tokio::test]
+    async fn a_name_missing_from_the_index_is_asked_for_once() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/formula.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(bulk(&[FOO])))
+            .mount(&mock_server)
+            .await;
+        // Newer than the index: the API still has it.
+        Mock::given(method("GET"))
+            .and(path("/formula/brand-new.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(FOO.replace("\"foo\"", "\"brand-new\"")),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
         Mock::given(method("GET"))
             .and(path("/formula/nonexistent.json"))
             .respond_with(ResponseTemplate::new(404))
+            .expect(1)
             .mount(&mock_server)
             .await;
 
-        let client = ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
+        let client = indexed_client(&mock_server, ApiCache::in_memory().unwrap());
+        assert_eq!(
+            client.get_formula("brand-new").await.unwrap().name,
+            "brand-new"
+        );
         let err = client.get_formula("nonexistent").await.unwrap_err();
+        assert!(matches!(err, Error::MissingFormula { name } if name == "nonexistent"));
+    }
 
-        assert!(matches!(
-            err,
-            Error::MissingFormula { name } if name == "nonexistent"
-        ));
+    #[tokio::test]
+    async fn an_unreachable_index_falls_back_to_the_cached_one_or_the_api() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/formula.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/formula/foo.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(FOO))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // No index yet: per-formula requests as before.
+        let client = indexed_client(&mock_server, ApiCache::in_memory().unwrap());
+        assert_eq!(client.get_formula("foo").await.unwrap().name, "foo");
+
+        // A stale index that cannot be refreshed is still used.
+        let cache = ApiCache::in_memory().unwrap();
+        cache
+            .replace_index(
+                index_entries(&bulk(&[FOO.replace("\"foo\"", "\"cached\"").as_str()])).unwrap(),
+                &IndexMeta {
+                    etag: None,
+                    last_modified: None,
+                    fetched_at: 0,
+                },
+            )
+            .unwrap();
+        let client = indexed_client(&mock_server, cache);
+        assert_eq!(client.get_formula("cached").await.unwrap().name, "cached");
+    }
+
+    #[tokio::test]
+    async fn refresh_index_forced_fetches_even_when_fresh() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/formula.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(bulk(&[FOO])))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let cache = ApiCache::in_memory().unwrap();
+        cache
+            .replace_index(
+                [],
+                &IndexMeta {
+                    etag: None,
+                    last_modified: None,
+                    fetched_at: unix_now(),
+                },
+            )
+            .unwrap();
+
+        let client = indexed_client(&mock_server, cache);
+        client.refresh_index(false).await.unwrap();
+        assert_eq!(client.index_len(), 0);
+        client.refresh_index(true).await.unwrap();
+        assert_eq!(client.index_len(), 1);
+    }
+
+    #[test]
+    fn index_entries_keep_bodies_verbatim_and_skip_nameless_entries() {
+        let entries = index_entries(
+            r#"[{"name":"python","aliases":["python@3.13"],"oldnames":["python3"],"x":1},{"aliases":["orphan"]},{"name":" ripgrep ","aliases":["rg","ripgrep"]}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "python");
+        assert_eq!(
+            entries[0].body,
+            r#"{"name":"python","aliases":["python@3.13"],"oldnames":["python3"],"x":1}"#
+        );
+        assert_eq!(entries[0].aliases, ["python@3.13", "python3"]);
+        assert_eq!(entries[1].name, "ripgrep");
+        assert_eq!(entries[1].aliases, ["rg"], "a name is not its own alias");
+        assert!(index_entries("{}").is_err());
     }
 }
