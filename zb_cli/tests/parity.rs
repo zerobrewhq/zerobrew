@@ -427,6 +427,13 @@ const CASES: &[Case] = &[
         kegs: &["jq", "oniguruma"],
         needs_default_prefix: false,
     },
+    // Placeholder rpaths, which `otool -L` does not list: the load commands
+    // must still come out like Homebrew's.
+    Case {
+        formula: "sqlite",
+        kegs: &["sqlite"],
+        needs_default_prefix: false,
+    },
 ];
 
 fn case(formula: &str) -> &'static Case {
@@ -555,6 +562,11 @@ fn ca_certificates_kegs_match_homebrew() {
 #[test]
 fn jq_kegs_match_homebrew() {
     check_kegs(case("jq"));
+}
+
+#[test]
+fn sqlite_kegs_match_homebrew() {
+    check_kegs(case("sqlite"));
 }
 
 /// The symlinks Homebrew creates in the prefix for a keg, keyed by their path
