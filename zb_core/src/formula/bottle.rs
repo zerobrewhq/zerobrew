@@ -88,14 +88,18 @@ fn is_compatible_linux_bottle_tag(tag: &str) -> bool {
     is_compatible_linux_bottle_tag_for_arch(tag, std::env::consts::ARCH)
 }
 
+/// The running macOS major version, asked of `sw_vers` once per process.
 #[cfg(target_os = "macos")]
 pub fn macos_major_version() -> Option<u32> {
-    let output = std::process::Command::new("sw_vers")
-        .arg("-productVersion")
-        .output()
-        .ok()?;
-    let version = String::from_utf8_lossy(&output.stdout);
-    version.trim().split('.').next()?.parse().ok()
+    static VERSION: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| {
+        let output = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()?;
+        let version = String::from_utf8_lossy(&output.stdout);
+        version.trim().split('.').next()?.parse().ok()
+    })
 }
 
 fn codename_for_major(major: u32) -> Option<&'static str> {
