@@ -8,6 +8,7 @@ rust-version.workspace = true
 flate2.workspace = true
 futures.workspace = true
 libc.workspace = true
+memchr.workspace = true
 futures-util.workspace = true
 rayon.workspace = true
 regex.workspace = true
