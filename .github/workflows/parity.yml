@@ -33,6 +33,11 @@ on:
     - cron: '17 6 * * *'
   workflow_dispatch:
 
+# The timing job comments its table on pull requests.
+permissions:
+  contents: read
+  pull-requests: write
+
 concurrency:
   group: parity-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -109,4 +114,33 @@ jobs:
           ZB_TIMING_BASELINE: /tmp/zb-release
           ZB_TIMING_MIN_SPEEDUP: ${{ github.event_name == 'schedule' && '1.5' || '' }}
           ZB_TIMING_MAX_REGRESSION: ${{ github.event_name == 'schedule' && '1.2' || '' }}
+          ZB_TIMING_TABLE: /tmp/zb-timing.md
         run: cargo test --release --package zb_cli --features parity --test parity -- --nocapture install_timings
+
+      # One comment per pull request, edited on every run so it never piles
+      # up. The token is read-only for pull requests from forks, so those
+      # only get the job summary.
+      - name: comment the table on the pull request
+        if: github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          marker='<!-- zb-timing -->'
+          {
+            echo "$marker"
+            echo "### install timings, cold"
+            echo
+            cat /tmp/zb-timing.md
+            echo
+            echo "_${SHA:0:7}, macos-latest, each zb build 3 rounds, fastest counts. Last release is the newest GitHub release._"
+          } > /tmp/zb-timing-comment.md
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -1)
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" \
+              -F body=@/tmp/zb-timing-comment.md >/dev/null
+          else
+            gh pr comment "$PR" --body-file /tmp/zb-timing-comment.md
+          fi

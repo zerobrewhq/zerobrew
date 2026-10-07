@@ -844,6 +844,10 @@ fn install_timings() {
             .expect("cannot open GITHUB_STEP_SUMMARY");
         writeln!(file, "### install timings, cold\n\n{table}").expect("cannot write summary");
     }
+    // For the workflow to post on the pull request.
+    if let Some(path) = std::env::var_os("ZB_TIMING_TABLE") {
+        fs::write(path, &table).expect("cannot write ZB_TIMING_TABLE");
+    }
 
     if let Some(min) = min_speedup() {
         let slow: Vec<String> = timings
