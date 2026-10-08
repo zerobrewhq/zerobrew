@@ -91,7 +91,7 @@ zbx jq --version                # run without linking
 
 </div>
 
-Measured on 2026-10-08 with zerobrew 0.3.5 and Homebrew 7.0.8 on macOS 26.6.2, MacBook Pro (M3 Pro, 18 GB RAM), ~318 Mbit/s download bandwidth. Homebrew started with nothing installed.
+Measured on 2026-10-08 with zerobrew 0.3.5 (development release) and Homebrew 7.0.8 on macOS 26.6.2, MacBook Pro (M3 Pro, 18 GB RAM), ~318 Mbit/s download bandwidth. Homebrew started with nothing installed.
 
 - **Cold**: the package and all of its dependencies uninstalled, empty download cache.
 - **Warm**: the package and all of its dependencies uninstalled, downloads from the cold run still cached.
@@ -212,6 +212,16 @@ To reproduce, run `just bench --full results/` on a machine with nothing install
 A smaller version runs in CI: the [parity workflow](https://github.com/zerobrewhq/zerobrew/actions/workflows/parity.yml) installs a fixed set of formulae with both tools on the same runner and compares the resulting prefixes byte for byte, and the [timing workflow](https://github.com/zerobrewhq/zerobrew/actions/workflows/timing.yml) times those formulae plus node and python@3.14, cold and warm, with both tools and with the last zerobrew release. 
 
 The nightly timing run fails if zerobrew is less than 1.5x faster than Homebrew cold or 3x warm on any of them, or more than 20% slower than the last release overall.
+
+## A note on how we are achieving these speeds
+
+WRT to Homebrew, I want it to be clear that both `brew` and `zerobrew` install the same bottles from *Homebrew's build farm*. 
+
+The difference is what happens after the download: Homebrew runs Ruby to evaluate the formula, unpacks, rewrites paths with `install_name_tool`, and re-signs each binary one at a time, while zerobrew **does the relocation in-process** and links from a content-addressed store, so it pays for the download once and almost nothing after.
+
+**I want it to be clear that we are basically** nothing without Homebrew's bottle build farm. Every package zerobrew installs is one they built, tested and published. We don't compile anything, we don't maintain formulae, and none of these numbers exist without that work. The speed comes from how the artifacts are installed, not from what's in them.
+
+This is a good read, if you're interested in what zerobrew is and isn't: [Standing on the shoulders of Homebrew](https://nesbitt.io/2026/04/14/standing-on-the-shoulders-of-homebrew.html) by Andrew Nesbitt. It makes the point better than I can.
 
 ## Relationship with Homebrew
 

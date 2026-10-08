@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Zerobrew Benchmark Results</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background: #f5f5f5; }
+        .container { max-width: 1100px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { color: #333; border-bottom: 2px solid #0066cc; padding-bottom: 10px; }
+        .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 20px; margin: 20px 0; }
+        .stat { background: #f8f9fa; padding: 20px; border-radius: 8px; text-align: center; }
+        .stat-value { font-size: 2em; font-weight: bold; color: #0066cc; }
+        .stat-label { color: #666; margin-top: 5px; }
+        table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #0066cc; color: white; }
+        tr:hover { background: #f5f5f5; }
+        .speedup { font-weight: bold; color: #28a745; }
+        .failed { color: #dc3545; }
+        .env { color: #555; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Zerobrew Benchmark Results</h1>
+        <ul class="env">
+            <li>Date: 2026-10-08</li>
+            <li>zerobrew: zb 0.3.5</li>
+            <li>Homebrew: Homebrew 7.0.8</li>
+            <li>OS: macOS 26.6.2 (arm64)</li>
+            <li>Hardware: Mac15,6, Apple M3 Pro, 18 GB RAM</li>
+            <li>Network: ~318 Mbit/s</li>
+            <li>Homebrew formulae installed before run: 0</li>
+        </ul>
+        <div class="summary">
+            <div class="stat"><div class="stat-value">100</div><div class="stat-label">Packages Tested</div></div>
+            <div class="stat"><div class="stat-value">100</div><div class="stat-label">Passed</div></div>
+            <div class="stat"><div class="stat-value">6.60x</div><div class="stat-label">Cold Speedup (total)</div></div>
+            <div class="stat"><div class="stat-value">68.31x</div><div class="stat-label">Warm Speedup (total)</div></div>
+        </div>
+        <h2>Results</h2>
+        <table>
+            <thead>
+                <tr><th>Package</th><th>Homebrew Cold</th><th>ZB Cold</th><th>Homebrew Warm</th><th>ZB Warm</th><th>Speedup (cold/warm)</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>ca-certificates</td><td>7.65s</td><td>376ms</td><td>6.55s</td><td>26ms</td><td class="speedup">20.35x / 252.12x</td></tr>
+                <tr><td>openssl@3</td><td>11.02s</td><td>1.30s</td><td>9.18s</td><td>64ms</td><td class="speedup">8.46x / 143.47x</td></tr>
+                <tr><td>xz</td><td>2.39s</td><td>454ms</td><td>1.46s</td><td>29ms</td><td class="speedup">5.26x / 50.31x</td></tr>
+                <tr><td>sqlite</td><td>2.99s</td><td>591ms</td><td>2.04s</td><td>27ms</td><td class="speedup">5.06x / 75.67x</td></tr>
+                <tr><td>readline</td><td>2.48s</td><td>494ms</td><td>1.46s</td><td>26ms</td><td class="speedup">5.02x / 56.08x</td></tr>
+                <tr><td>icu4c@78</td><td>3.32s</td><td>1.57s</td><td>1.96s</td><td>33ms</td><td class="speedup">2.11x / 59.42x</td></tr>
+                <tr><td>python@3.14</td><td>16.99s</td><td>1.97s</td><td>14.37s</td><td>207ms</td><td class="speedup">8.62x / 69.41x</td></tr>
+                <tr><td>awscli</td><td>27.22s</td><td>3.37s</td><td>25.56s</td><td>483ms</td><td class="speedup">8.08x / 52.92x</td></tr>
+                <tr><td>node</td><td>29.31s</td><td>3.16s</td><td>28.24s</td><td>232ms</td><td class="speedup">9.28x / 121.72x</td></tr>
+                <tr><td>harfbuzz</td><td>29.34s</td><td>2.20s</td><td>22.35s</td><td>364ms</td><td class="speedup">13.34x / 61.41x</td></tr>
+                <tr><td>ncurses</td><td>3.13s</td><td>1.04s</td><td>2.04s</td><td>69ms</td><td class="speedup">3.01x / 29.59x</td></tr>
+                <tr><td>gh</td><td>2.60s</td><td>903ms</td><td>1.35s</td><td>38ms</td><td class="speedup">2.87x / 35.58x</td></tr>
+                <tr><td>pcre2</td><td>2.58s</td><td>631ms</td><td>1.57s</td><td>35ms</td><td class="speedup">4.08x / 44.94x</td></tr>
+                <tr><td>libpng</td><td>2.49s</td><td>854ms</td><td>1.50s</td><td>27ms</td><td class="speedup">2.92x / 55.70x</td></tr>
+                <tr><td>zstd</td><td>4.12s</td><td>672ms</td><td>2.74s</td><td>34ms</td><td class="speedup">6.13x / 80.50x</td></tr>
+                <tr><td>glib</td><td>7.02s</td><td>1.72s</td><td>5.24s</td><td>94ms</td><td class="speedup">4.08x / 55.76x</td></tr>
+                <tr><td>lz4</td><td>2.89s</td><td>635ms</td><td>1.48s</td><td>27ms</td><td class="speedup">4.54x / 54.74x</td></tr>
+                <tr><td>gettext</td><td>4.72s</td><td>1.30s</td><td>3.25s</td><td>64ms</td><td class="speedup">3.61x / 50.81x</td></tr>
+                <tr><td>libngtcp2</td><td>10.79s</td><td>1.40s</td><td>9.20s</td><td>66ms</td><td class="speedup">7.73x / 139.36x</td></tr>
+                <tr><td>libnghttp3</td><td>2.38s</td><td>436ms</td><td>1.47s</td><td>27ms</td><td class="speedup">5.47x / 54.44x</td></tr>
+                <tr><td>pkgconf</td><td>2.35s</td><td>469ms</td><td>1.47s</td><td>27ms</td><td class="speedup">5.02x / 54.59x</td></tr>
+                <tr><td>libunistring</td><td>2.57s</td><td>981ms</td><td>1.49s</td><td>26ms</td><td class="speedup">2.62x / 57.12x</td></tr>
+                <tr><td>mpdecimal</td><td>2.53s</td><td>705ms</td><td>1.47s</td><td>27ms</td><td class="speedup">3.59x / 54.33x</td></tr>
+                <tr><td>brotli</td><td>2.65s</td><td>776ms</td><td>1.48s</td><td>27ms</td><td class="speedup">3.41x / 54.67x</td></tr>
+                <tr><td>jpeg-turbo</td><td>2.55s</td><td>889ms</td><td>1.48s</td><td>27ms</td><td class="speedup">2.87x / 54.78x</td></tr>
+                <tr><td>xorgproto</td><td>2.21s</td><td>484ms</td><td>1.21s</td><td>29ms</td><td class="speedup">4.57x / 41.59x</td></tr>
+                <tr><td>ffmpeg</td><td>18.57s</td><td>1.76s</td><td>17.62s</td><td>164ms</td><td class="speedup">10.54x / 107.41x</td></tr>
+                <tr><td>cmake</td><td>4.04s</td><td>1.66s</td><td>1.73s</td><td>80ms</td><td class="speedup">2.44x / 21.64x</td></tr>
+                <tr><td>libnghttp2</td><td>2.63s</td><td>635ms</td><td>1.46s</td><td>26ms</td><td class="speedup">4.14x / 56.31x</td></tr>
+                <tr><td>go</td><td>5.43s</td><td>3.36s</td><td>3.40s</td><td>190ms</td><td class="speedup">1.61x / 17.92x</td></tr>
+                <tr><td>uv</td><td>2.90s</td><td>1.37s</td><td>1.27s</td><td>28ms</td><td class="speedup">2.12x / 45.43x</td></tr>
+                <tr><td>gmp</td><td>2.62s</td><td>543ms</td><td>1.47s</td><td>26ms</td><td class="speedup">4.83x / 56.42x</td></tr>
+                <tr><td>libtiff</td><td>7.08s</td><td>821ms</td><td>6.11s</td><td>53ms</td><td class="speedup">8.62x / 115.19x</td></tr>
+                <tr><td>fontconfig</td><td>9.35s</td><td>982ms</td><td>8.13s</td><td>77ms</td><td class="speedup">9.52x / 105.61x</td></tr>
+                <tr><td>python@3.13</td><td>14.28s</td><td>1.76s</td><td>13.15s</td><td>186ms</td><td class="speedup">8.12x / 70.71x</td></tr>
+                <tr><td>git</td><td>6.46s</td><td>1.67s</td><td>4.98s</td><td>101ms</td><td class="speedup">3.88x / 49.33x</td></tr>
+                <tr><td>little-cms2</td><td>7.85s</td><td>792ms</td><td>6.83s</td><td>55ms</td><td class="speedup">9.91x / 124.16x</td></tr>
+                <tr><td>dav1d</td><td>2.49s</td><td>544ms</td><td>1.47s</td><td>26ms</td><td class="speedup">4.58x / 56.42x</td></tr>
+                <tr><td>openexr</td><td>9.95s</td><td>712ms</td><td>8.83s</td><td>59ms</td><td class="speedup">13.98x / 149.59x</td></tr>
+                <tr><td>c-ares</td><td>2.51s</td><td>513ms</td><td>1.51s</td><td>32ms</td><td class="speedup">4.90x / 47.34x</td></tr>
+                <tr><td>tesseract</td><td>34.63s</td><td>2.16s</td><td>32.37s</td><td>476ms</td><td class="speedup">16.01x / 68.01x</td></tr>
+                <tr><td>p11-kit</td><td>9.26s</td><td>996ms</td><td>7.95s</td><td>32ms</td><td class="speedup">9.30x / 248.53x</td></tr>
+                <tr><td>imagemagick</td><td>14.51s</td><td>1.21s</td><td>13.20s</td><td>82ms</td><td class="speedup">12.00x / 160.95x</td></tr>
+                <tr><td>zlib</td><td>2.36s</td><td>430ms</td><td>1.46s</td><td>25ms</td><td class="speedup">5.48x / 58.44x</td></tr>
+                <tr><td>libx11</td><td>5.70s</td><td>932ms</td><td>4.71s</td><td>174ms</td><td class="speedup">6.11x / 27.05x</td></tr>
+                <tr><td>freetype</td><td>3.51s</td><td>585ms</td><td>2.21s</td><td>32ms</td><td class="speedup">5.99x / 69.22x</td></tr>
+                <tr><td>protobuf</td><td>4.06s</td><td>725ms</td><td>3.09s</td><td>57ms</td><td class="speedup">5.60x / 54.21x</td></tr>
+                <tr><td>gnupg</td><td>21.97s</td><td>1.36s</td><td>20.63s</td><td>192ms</td><td class="speedup">16.16x / 107.44x</td></tr>
+                <tr><td>openjph</td><td>7.88s</td><td>697ms</td><td>6.80s</td><td>54ms</td><td class="speedup">11.31x / 126.02x</td></tr>
+                <tr><td>libtasn1</td><td>2.30s</td><td>461ms</td><td>1.49s</td><td>28ms</td><td class="speedup">4.99x / 53.25x</td></tr>
+                <tr><td>ruby</td><td>16.01s</td><td>3.83s</td><td>14.56s</td><td>801ms</td><td class="speedup">4.18x / 18.18x</td></tr>
+                <tr><td>gnutls</td><td>14.93s</td><td>1.19s</td><td>13.93s</td><td>134ms</td><td class="speedup">12.52x / 103.96x</td></tr>
+                <tr><td>expat</td><td>2.40s</td><td>442ms</td><td>1.48s</td><td>26ms</td><td class="speedup">5.42x / 56.88x</td></tr>
+                <tr><td>libsodium</td><td>2.44s</td><td>884ms</td><td>1.48s</td><td>27ms</td><td class="speedup">2.76x / 54.96x</td></tr>
+                <tr><td>simdjson</td><td>2.52s</td><td>619ms</td><td>1.49s</td><td>26ms</td><td class="speedup">4.08x / 57.12x</td></tr>
+                <tr><td>gemini-cli</td><td>29.98s</td><td>2.23s</td><td>27.64s</td><td>235ms</td><td class="speedup">13.43x / 117.60x</td></tr>
+                <tr><td>libarchive</td><td>5.02s</td><td>594ms</td><td>4.04s</td><td>35ms</td><td class="speedup">8.45x / 115.31x</td></tr>
+                <tr><td>pyenv</td><td>12.61s</td><td>1.39s</td><td>11.44s</td><td>135ms</td><td class="speedup">9.06x / 84.76x</td></tr>
+                <tr><td>pixman</td><td>2.44s</td><td>487ms</td><td>1.49s</td><td>26ms</td><td class="speedup">5.01x / 57.19x</td></tr>
+                <tr><td>curl</td><td>16.37s</td><td>1.47s</td><td>15.20s</td><td>173ms</td><td class="speedup">11.12x / 87.88x</td></tr>
+                <tr><td>opus</td><td>2.37s</td><td>497ms</td><td>1.47s</td><td>27ms</td><td class="speedup">4.76x / 54.59x</td></tr>
+                <tr><td>unbound</td><td>12.24s</td><td>1.35s</td><td>11.03s</td><td>113ms</td><td class="speedup">9.07x / 97.58x</td></tr>
+                <tr><td>cairo</td><td>19.28s</td><td>1.48s</td><td>17.74s</td><td>370ms</td><td class="speedup">12.99x / 47.95x</td></tr>
+                <tr><td>pango</td><td>24.48s</td><td>1.69s</td><td>23.06s</td><td>411ms</td><td class="speedup">14.46x / 56.10x</td></tr>
+                <tr><td>leptonica</td><td>9.48s</td><td>914ms</td><td>8.39s</td><td>66ms</td><td class="speedup">10.37x / 127.18x</td></tr>
+                <tr><td>libxcb</td><td>4.88s</td><td>887ms</td><td>3.89s</td><td>132ms</td><td class="speedup">5.50x / 29.45x</td></tr>
+                <tr><td>jpeg-xl</td><td>12.96s</td><td>997ms</td><td>11.92s</td><td>70ms</td><td class="speedup">13.00x / 170.31x</td></tr>
+                <tr><td>coreutils</td><td>3.31s</td><td>760ms</td><td>2.24s</td><td>38ms</td><td class="speedup">4.35x / 58.97x</td></tr>
+                <tr><td>certifi</td><td>7.81s</td><td>461ms</td><td>6.98s</td><td>31ms</td><td class="speedup">16.95x / 225.06x</td></tr>
+                <tr><td>krb5</td><td>10.49s</td><td>1.34s</td><td>9.28s</td><td>68ms</td><td class="speedup">7.85x / 136.44x</td></tr>
+                <tr><td>docker</td><td>2.26s</td><td>734ms</td><td>1.21s</td><td>29ms</td><td class="speedup">3.08x / 41.83x</td></tr>
+                <tr><td>libheif</td><td>10.88s</td><td>961ms</td><td>9.59s</td><td>63ms</td><td class="speedup">11.32x / 152.24x</td></tr>
+                <tr><td>webp</td><td>4.31s</td><td>578ms</td><td>3.37s</td><td>35ms</td><td class="speedup">7.46x / 96.40x</td></tr>
+                <tr><td>libxext</td><td>6.45s</td><td>982ms</td><td>5.42s</td><td>182ms</td><td class="speedup">6.57x / 29.80x</td></tr>
+                <tr><td>libxau</td><td>2.74s</td><td>512ms</td><td>1.85s</td><td>33ms</td><td class="speedup">5.35x / 56.06x</td></tr>
+                <tr><td>gcc</td><td>12.23s</td><td>3.55s</td><td>8.58s</td><td>67ms</td><td class="speedup">3.45x / 128.00x</td></tr>
+                <tr><td>bzip2</td><td>2.09s</td><td>368ms</td><td>1.14s</td><td>26ms</td><td class="speedup">5.69x / 43.65x</td></tr>
+                <tr><td>libxdmcp</td><td>2.74s</td><td>540ms</td><td>1.86s</td><td>33ms</td><td class="speedup">5.08x / 56.42x</td></tr>
+                <tr><td>abseil</td><td>3.05s</td><td>800ms</td><td>1.90s</td><td>50ms</td><td class="speedup">3.82x / 38.04x</td></tr>
+                <tr><td>xcbeautify</td><td>2.22s</td><td>481ms</td><td>1.15s</td><td>26ms</td><td class="speedup">4.62x / 44.35x</td></tr>
+                <tr><td>libuv</td><td>2.51s</td><td>482ms</td><td>1.47s</td><td>26ms</td><td class="speedup">5.20x / 56.65x</td></tr>
+                <tr><td>giflib</td><td>2.31s</td><td>673ms</td><td>1.46s</td><td>26ms</td><td class="speedup">3.44x / 56.12x</td></tr>
+                <tr><td>utf8proc</td><td>2.36s</td><td>452ms</td><td>1.46s</td><td>27ms</td><td class="speedup">5.23x / 54.15x</td></tr>
+                <tr><td>libxrender</td><td>6.35s</td><td>976ms</td><td>5.42s</td><td>179ms</td><td class="speedup">6.51x / 30.25x</td></tr>
+                <tr><td>m4</td><td>2.00s</td><td>431ms</td><td>1.13s</td><td>25ms</td><td class="speedup">4.65x / 45.28x</td></tr>
+                <tr><td>graphite2</td><td>2.47s</td><td>428ms</td><td>1.46s</td><td>26ms</td><td class="speedup">5.78x / 56.23x</td></tr>
+                <tr><td>openjdk</td><td>32.09s</td><td>5.17s</td><td>26.86s</td><td>448ms</td><td class="speedup">6.21x / 59.96x</td></tr>
+                <tr><td>uvwasi</td><td>2.95s</td><td>483ms</td><td>2.11s</td><td>29ms</td><td class="speedup">6.10x / 72.66x</td></tr>
+                <tr><td>libffi</td><td>2.56s</td><td>575ms</td><td>1.43s</td><td>26ms</td><td class="speedup">4.46x / 55.08x</td></tr>
+                <tr><td>libdeflate</td><td>2.44s</td><td>458ms</td><td>1.46s</td><td>26ms</td><td class="speedup">5.33x / 56.12x</td></tr>
+                <tr><td>llvm</td><td>18.22s</td><td>9.14s</td><td>9.66s</td><td>183ms</td><td class="speedup">1.99x / 52.79x</td></tr>
+                <tr><td>aom</td><td>3.25s</td><td>699ms</td><td>2.16s</td><td>32ms</td><td class="speedup">4.65x / 67.50x</td></tr>
+                <tr><td>lzo</td><td>2.38s</td><td>449ms</td><td>1.46s</td><td>26ms</td><td class="speedup">5.31x / 56.00x</td></tr>
+                <tr><td>libevent</td><td>10.66s</td><td>1.33s</td><td>9.19s</td><td>71ms</td><td class="speedup">7.99x / 129.42x</td></tr>
+                <tr><td>libgpg-error</td><td>5.06s</td><td>1.11s</td><td>3.84s</td><td>70ms</td><td class="speedup">4.56x / 54.81x</td></tr>
+                <tr><td>libidn2</td><td>4.97s</td><td>1.09s</td><td>3.87s</td><td>69ms</td><td class="speedup">4.56x / 56.12x</td></tr>
+                <tr><td>berkeley-db@5</td><td>4.05s</td><td>1.96s</td><td>2.60s</td><td>56ms</td><td class="speedup">2.06x / 46.45x</td></tr>
+                <tr><td>deno</td><td>10.57s</td><td>1.46s</td><td>9.24s</td><td>57ms</td><td class="speedup">7.23x / 162.09x</td></tr>
+                <tr><td>libedit</td><td>2.35s</td><td>442ms</td><td>1.45s</td><td>26ms</td><td class="speedup">5.33x / 55.65x</td></tr>
+                <tr><td>oniguruma</td><td>2.37s</td><td>508ms</td><td>1.46s</td><td>26ms</td><td class="speedup">4.67x / 56.19x</td></tr>
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>

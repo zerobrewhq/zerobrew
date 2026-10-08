@@ -1,0 +1,122 @@
+=== Benchmark Summary ===
+Date:      2026-10-08
+zerobrew:  zb 0.3.5
+Homebrew:  Homebrew 7.0.8
+OS:        macOS 26.6.2 (arm64)
+Hardware:  Mac15,6, Apple M3 Pro, 18 GB RAM
+Network:   ~318 Mbit/s
+Homebrew formulae installed before run: 0
+
+Tested: 100 packages
+Passed: 100
+Failed: 0
+
+Total time:
+  Cold: Homebrew 775.60s, zerobrew 117.43s (6.60x)
+  Warm: Homebrew 637.50s, zerobrew 9.33s (68.31x)
+
+Results:
+Package            HB cold    ZB cold    HB warm    ZB warm     Cold     Warm
+-------------------------------------------------------------------------------
+ca-certificates      7.65s      376ms      6.55s       26ms   20.35x  252.12x
+openssl@3           11.02s      1.30s      9.18s       64ms    8.46x  143.47x
+xz                   2.39s      454ms      1.46s       29ms    5.26x   50.31x
+sqlite               2.99s      591ms      2.04s       27ms    5.06x   75.67x
+readline             2.48s      494ms      1.46s       26ms    5.02x   56.08x
+icu4c@78             3.32s      1.57s      1.96s       33ms    2.11x   59.42x
+python@3.14         16.99s      1.97s     14.37s      207ms    8.62x   69.41x
+awscli              27.22s      3.37s     25.56s      483ms    8.08x   52.92x
+node                29.31s      3.16s     28.24s      232ms    9.28x  121.72x
+harfbuzz            29.34s      2.20s     22.35s      364ms   13.34x   61.41x
+ncurses              3.13s      1.04s      2.04s       69ms    3.01x   29.59x
+gh                   2.60s      903ms      1.35s       38ms    2.87x   35.58x
+pcre2                2.58s      631ms      1.57s       35ms    4.08x   44.94x
+libpng               2.49s      854ms      1.50s       27ms    2.92x   55.70x
+zstd                 4.12s      672ms      2.74s       34ms    6.13x   80.50x
+glib                 7.02s      1.72s      5.24s       94ms    4.08x   55.76x
+lz4                  2.89s      635ms      1.48s       27ms    4.54x   54.74x
+gettext              4.72s      1.30s      3.25s       64ms    3.61x   50.81x
+libngtcp2           10.79s      1.40s      9.20s       66ms    7.73x  139.36x
+libnghttp3           2.38s      436ms      1.47s       27ms    5.47x   54.44x
+pkgconf              2.35s      469ms      1.47s       27ms    5.02x   54.59x
+libunistring         2.57s      981ms      1.49s       26ms    2.62x   57.12x
+mpdecimal            2.53s      705ms      1.47s       27ms    3.59x   54.33x
+brotli               2.65s      776ms      1.48s       27ms    3.41x   54.67x
+jpeg-turbo           2.55s      889ms      1.48s       27ms    2.87x   54.78x
+xorgproto            2.21s      484ms      1.21s       29ms    4.57x   41.59x
+ffmpeg              18.57s      1.76s     17.62s      164ms   10.54x  107.41x
+cmake                4.04s      1.66s      1.73s       80ms    2.44x   21.64x
+libnghttp2           2.63s      635ms      1.46s       26ms    4.14x   56.31x
+go                   5.43s      3.36s      3.40s      190ms    1.61x   17.92x
+uv                   2.90s      1.37s      1.27s       28ms    2.12x   45.43x
+gmp                  2.62s      543ms      1.47s       26ms    4.83x   56.42x
+libtiff              7.08s      821ms      6.11s       53ms    8.62x  115.19x
+fontconfig           9.35s      982ms      8.13s       77ms    9.52x  105.61x
+python@3.13         14.28s      1.76s     13.15s      186ms    8.12x   70.71x
+git                  6.46s      1.67s      4.98s      101ms    3.88x   49.33x
+little-cms2          7.85s      792ms      6.83s       55ms    9.91x  124.16x
+dav1d                2.49s      544ms      1.47s       26ms    4.58x   56.42x
+openexr              9.95s      712ms      8.83s       59ms   13.98x  149.59x
+c-ares               2.51s      513ms      1.51s       32ms    4.90x   47.34x
+tesseract           34.63s      2.16s     32.37s      476ms   16.01x   68.01x
+p11-kit              9.26s      996ms      7.95s       32ms    9.30x  248.53x
+imagemagick         14.51s      1.21s     13.20s       82ms   12.00x  160.95x
+zlib                 2.36s      430ms      1.46s       25ms    5.48x   58.44x
+libx11               5.70s      932ms      4.71s      174ms    6.11x   27.05x
+freetype             3.51s      585ms      2.21s       32ms    5.99x   69.22x
+protobuf             4.06s      725ms      3.09s       57ms    5.60x   54.21x
+gnupg               21.97s      1.36s     20.63s      192ms   16.16x  107.44x
+openjph              7.88s      697ms      6.80s       54ms   11.31x  126.02x
+libtasn1             2.30s      461ms      1.49s       28ms    4.99x   53.25x
+ruby                16.01s      3.83s     14.56s      801ms    4.18x   18.18x
+gnutls              14.93s      1.19s     13.93s      134ms   12.52x  103.96x
+expat                2.40s      442ms      1.48s       26ms    5.42x   56.88x
+libsodium            2.44s      884ms      1.48s       27ms    2.76x   54.96x
+simdjson             2.52s      619ms      1.49s       26ms    4.08x   57.12x
+gemini-cli          29.98s      2.23s     27.64s      235ms   13.43x  117.60x
+libarchive           5.02s      594ms      4.04s       35ms    8.45x  115.31x
+pyenv               12.61s      1.39s     11.44s      135ms    9.06x   84.76x
+pixman               2.44s      487ms      1.49s       26ms    5.01x   57.19x
+curl                16.37s      1.47s     15.20s      173ms   11.12x   87.88x
+opus                 2.37s      497ms      1.47s       27ms    4.76x   54.59x
+unbound             12.24s      1.35s     11.03s      113ms    9.07x   97.58x
+cairo               19.28s      1.48s     17.74s      370ms   12.99x   47.95x
+pango               24.48s      1.69s     23.06s      411ms   14.46x   56.10x
+leptonica            9.48s      914ms      8.39s       66ms   10.37x  127.18x
+libxcb               4.88s      887ms      3.89s      132ms    5.50x   29.45x
+jpeg-xl             12.96s      997ms     11.92s       70ms   13.00x  170.31x
+coreutils            3.31s      760ms      2.24s       38ms    4.35x   58.97x
+certifi              7.81s      461ms      6.98s       31ms   16.95x  225.06x
+krb5                10.49s      1.34s      9.28s       68ms    7.85x  136.44x
+docker               2.26s      734ms      1.21s       29ms    3.08x   41.83x
+libheif             10.88s      961ms      9.59s       63ms   11.32x  152.24x
+webp                 4.31s      578ms      3.37s       35ms    7.46x   96.40x
+libxext              6.45s      982ms      5.42s      182ms    6.57x   29.80x
+libxau               2.74s      512ms      1.85s       33ms    5.35x   56.06x
+gcc                 12.23s      3.55s      8.58s       67ms    3.45x  128.00x
+bzip2                2.09s      368ms      1.14s       26ms    5.69x   43.65x
+libxdmcp             2.74s      540ms      1.86s       33ms    5.08x   56.42x
+abseil               3.05s      800ms      1.90s       50ms    3.82x   38.04x
+xcbeautify           2.22s      481ms      1.15s       26ms    4.62x   44.35x
+libuv                2.51s      482ms      1.47s       26ms    5.20x   56.65x
+giflib               2.31s      673ms      1.46s       26ms    3.44x   56.12x
+utf8proc             2.36s      452ms      1.46s       27ms    5.23x   54.15x
+libxrender           6.35s      976ms      5.42s      179ms    6.51x   30.25x
+m4                   2.00s      431ms      1.13s       25ms    4.65x   45.28x
+graphite2            2.47s      428ms      1.46s       26ms    5.78x   56.23x
+openjdk             32.09s      5.17s     26.86s      448ms    6.21x   59.96x
+uvwasi               2.95s      483ms      2.11s       29ms    6.10x   72.66x
+libffi               2.56s      575ms      1.43s       26ms    4.46x   55.08x
+libdeflate           2.44s      458ms      1.46s       26ms    5.33x   56.12x
+llvm                18.22s      9.14s      9.66s      183ms    1.99x   52.79x
+aom                  3.25s      699ms      2.16s       32ms    4.65x   67.50x
+lzo                  2.38s      449ms      1.46s       26ms    5.31x   56.00x
+libevent            10.66s      1.33s      9.19s       71ms    7.99x  129.42x
+libgpg-error         5.06s      1.11s      3.84s       70ms    4.56x   54.81x
+libidn2              4.97s      1.09s      3.87s       69ms    4.56x   56.12x
+berkeley-db@5        4.05s      1.96s      2.60s       56ms    2.06x   46.45x
+deno                10.57s      1.46s      9.24s       57ms    7.23x  162.09x
+libedit              2.35s      442ms      1.45s       26ms    5.33x   55.65x
+oniguruma            2.37s      508ms      1.46s       26ms    4.67x   56.19x
+
+Done.
