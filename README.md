@@ -215,7 +215,7 @@ The nightly timing run fails if zerobrew is less than 1.5x faster than Homebrew 
 
 ## A note on how we are achieving these speeds
 
-WRT to Homebrew, I want it to be clear that both `brew` and `zerobrew` install the same bottles from *Homebrew's build farm*. 
+WRT Homebrew, I want it to be clear that both `brew` and `zerobrew` install the same bottles from *Homebrew's build farm*. 
 
 The difference is what happens after the download: Homebrew runs Ruby to evaluate the formula, unpacks, rewrites paths with `install_name_tool`, and re-signs each binary one at a time, while zerobrew **does the relocation in-process** and links from a content-addressed store, so it pays for the download once and almost nothing after.
 
