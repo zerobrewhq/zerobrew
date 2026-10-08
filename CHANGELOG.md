@@ -7,12 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-07
+
 ### Added
 - `zb doctor` reports installed packages that load a library that no longer exists, such as after a dependency changed major version. macOS only for now, and report-only
 - `ZEROBREW_API_AUTO_UPDATE_SECS` sets how long the formula index is trusted before it is checked against the API again, like Homebrew's `HOMEBREW_API_AUTO_UPDATE_SECS`. Defaults to 600 ([#431](https://github.com/zerobrewhq/zerobrew/pull/431))
 - `zb update` reports how many formulas it indexed ([#431](https://github.com/zerobrewhq/zerobrew/pull/431))
 - The parity harness covers `sqlite`, whose rpaths carry placeholders ([#427](https://github.com/zerobrewhq/zerobrew/pull/427))
-- CI times a cold install of each parity formula with Homebrew, with zerobrew and with the last zerobrew release on the same runner. The nightly run fails if zerobrew is less than 1.5x faster than Homebrew on any formula, or more than 20% slower than the last release over all of them, and pull requests get the table as a comment ([#426](https://github.com/zerobrewhq/zerobrew/pull/426), [#428](https://github.com/zerobrewhq/zerobrew/pull/428))
+- CI times each parity formula plus `node` and `python@3.14`, cold and warm, with Homebrew, with zerobrew and with the last zerobrew release on the same runner. The nightly run fails if zerobrew is less than 1.5x faster than Homebrew cold or 3x warm on any formula, or more than 20% slower than the last release over all of them. It runs in its own workflow on pull requests that touch the install code, and comments the table ([#426](https://github.com/zerobrewhq/zerobrew/pull/426), [#428](https://github.com/zerobrewhq/zerobrew/pull/428), [#434](https://github.com/zerobrewhq/zerobrew/pull/434))
 
 ### Changed
 - Bottles are relocated in-process on macOS: load commands are rewritten in place instead of running `otool` and one `install_name_tool` per library reference, which copied the whole binary each time. Warm installs of packages with many libraries are 3x to 17x faster (node 11.6s to 0.7s, llvm 7.4s to 2.2s) ([#427](https://github.com/zerobrewhq/zerobrew/pull/427))
@@ -20,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bottles are downloaded over one kept-alive connection pool with one registry token fetched for the whole install, instead of three fresh connections and an auth round trip per bottle. HTTP/2 is negotiated for the first time: the TLS configuration handed to reqwest never offered it. A cold install of a small package went from ~1.3s to ~0.9s and node's 25 bottles from ~4.5s to ~3.2s. Failed downloads are retried and then fall back to `HOMEBREW_BOTTLE_MIRRORS` ([#430](https://github.com/zerobrewhq/zerobrew/pull/430))
 - Formulas are resolved from a local index of Homebrew's bulk API file instead of one request per dependency level. The index is refreshed at most every ten minutes, `zb update` refreshes it on demand, and `zb outdated` reads it instead of parsing the whole file. The API cache schema is now v2 and migrates in place. Installing node and its 24 dependencies from a warm cache went from 0.78s to 0.19s ([#431](https://github.com/zerobrewhq/zerobrew/pull/431))
 - Bottles are unpacked and relocated while they download, several at a time, instead of one after another once every download finished. Installing llvm from nothing went from ~11s to ~7.5s, which is the transfer time of its bottle; node and its dependencies from 3.2s to 2.2s ([#432](https://github.com/zerobrewhq/zerobrew/pull/432))
+- Re-measure the README and site benchmarks with the new install path: 6.6x faster cold and 68x faster warm over 100 packages on a ~318 Mbit/s link, and 3.3x cold on a ~69 Mbit/s one. Both runs and their logs are under `results/`, and `just bench` refreshes the formula index untimed after each reset ([#435](https://github.com/zerobrewhq/zerobrew/pull/435))
 - `sw_vers` is run once per process instead of twice per formula while planning ([#431](https://github.com/zerobrewhq/zerobrew/pull/431))
 - The repository moved to the [`zerobrewhq`](https://github.com/zerobrewhq/zerobrew) organisation. Old `lucasgelfond/zerobrew` links redirect, and the install script and release downloads now use the new address
 - The Homebrew tap moved to `zerobrewhq/zerobrew`. Installs from `cachebag/zerobrew` keep updating, since that tap was transferred rather than replaced
@@ -186,7 +189,8 @@ To get an idea of the initial features zerobrew supports, take a look at the [RE
 
 See the [full commit history](https://github.com/zerobrewhq/zerobrew/commits/v0.1.1) for more details.
 
-[Unreleased]: https://github.com/zerobrewhq/zerobrew/compare/v0.3.5...HEAD
+[Unreleased]: https://github.com/zerobrewhq/zerobrew/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/zerobrewhq/zerobrew/compare/v0.3.5...v0.4.0
 [0.3.5]: https://github.com/zerobrewhq/zerobrew/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/zerobrewhq/zerobrew/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/zerobrewhq/zerobrew/compare/v0.3.2...v0.3.3

@@ -3,7 +3,7 @@ members = ["zb_core", "zb_io", "zb_cli"]
 resolver = "3"
 
 [workspace.package]
-version = "0.3.5"
+version = "0.4.0"
 rust-version = "1.96"
 
 [workspace.dependencies]
