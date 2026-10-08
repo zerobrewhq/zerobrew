@@ -219,7 +219,7 @@ WRT Homebrew, I want it to be clear that both `brew` and `zerobrew` install the 
 
 The difference is what happens after the download: Homebrew runs Ruby to evaluate the formula, unpacks, rewrites paths with `install_name_tool`, and re-signs each binary one at a time, while zerobrew **does the relocation in-process** and links from a content-addressed store, so it pays for the download once and almost nothing after.
 
-**I want it to be clear that we are basically** nothing without Homebrew's bottle build farm. Every package zerobrew installs is one they built, tested and published. We don't compile anything, we don't maintain formulae, and none of these numbers exist without that work. The speed comes from how the artifacts are installed, not from what's in them.
+**I want it to be clear that we are basically nothing without Homebrew's bottle build farm**. Every package zerobrew installs is one they built, tested and published. We don't compile anything, we don't maintain formulae, and none of these numbers exist without that work. The speed comes from how the artifacts are installed, not from what's in them.
 
 This is a good read, if you're interested in what zerobrew is and isn't: [Standing on the shoulders of Homebrew](https://nesbitt.io/2026/04/14/standing-on-the-shoulders-of-homebrew.html) by Andrew Nesbitt. It makes the point better than I can.
 
