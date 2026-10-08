@@ -242,14 +242,14 @@ doing so.
 ## Project status
 
 <div align="center">
-  <a href="https://star-history.dera.page/#zerobrewhq/zerobrew&Date">
+  <a href="https://star-history.com/#zerobrewhq/zerobrew&Date">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=zerobrewhq/zerobrew&type=Date&theme=dark" />
-      <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=zerobrewhq/zerobrew&type=Date" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=zerobrewhq/zerobrew&type=Date&theme=dark" />
+      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=zerobrewhq/zerobrew&type=Date" />
     </picture>
   </a>
 </div>
 
-- **Status:** Experimental, but quite useful. I ([@cachebag](https://github.com/cachebag) daily drive it myself).
+- **Status:** Experimental, but quite useful. I ([@cachebag](https://github.com/cachebag)) daily drive it myself.
 - **Feedback:** If you hit incompatibilities, please open an issue or PR.
 - **License:** Dual-licensed under [Apache 2.0](./LICENSE-APACHE.md) OR [MIT](./LICENSE-MIT.md), at your choice.
