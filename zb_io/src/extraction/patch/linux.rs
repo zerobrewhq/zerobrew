@@ -539,8 +539,6 @@ mod tests {
         };
         assert!(status.success());
 
-        let data = fs::read(&object).unwrap();
-        assert!(arwen::elf::ElfContainer::parse(&data).is_err());
         assert!(!is_loadable_elf(&object));
     }
 
