@@ -130,6 +130,26 @@ fn find_system_ld_so() -> Option<PathBuf> {
     None
 }
 
+/// Whether `path` is an ELF executable or shared library, the only kinds the
+/// dynamic loader reads RPATH and the interpreter from. Relocatable objects,
+/// like the `.o` files llvm ships, are left alone: there is nothing in them to
+/// patch, and arwen can't parse the C++ ones.
+fn is_loadable_elf(path: &Path) -> bool {
+    let mut header = [0u8; 18];
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    if file.read_exact(&mut header).is_err() || header[..4] != *b"\x7fELF" {
+        return false;
+    }
+    let e_type = match object::elf::DataEncoding(header[5]) {
+        object::elf::ELFDATA2LSB => u16::from_le_bytes([header[16], header[17]]),
+        object::elf::ELFDATA2MSB => u16::from_be_bytes([header[16], header[17]]),
+        _ => return false,
+    };
+    e_type == object::elf::ET_EXEC.0 || e_type == object::elf::ET_DYN.0
+}
+
 /// Patch @@HOMEBREW_CELLAR@@ and @@HOMEBREW_PREFIX@@ placeholders in ELF binaries.
 /// Uses `arwen` crate to natively update RPATH, RUNPATH, and optionally the ELF interpreter.
 fn patch_elf_placeholders(keg_path: &Path, prefix_dir: &Path) -> Result<(), Error> {
@@ -148,24 +168,13 @@ fn patch_elf_placeholders(keg_path: &Path, prefix_dir: &Path) -> Result<(), Erro
         find_system_ld_so()
     };
 
-    // Collect all ELF files
+    // Collect the ELF executables and shared libraries
     let elf_files: Vec<PathBuf> = walkdir::WalkDir::new(keg_path)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
-        .filter(|e| {
-            // Read only first 4 bytes to check magic
-            let mut file = match fs::File::open(e.path()) {
-                Ok(f) => f,
-                Err(_) => return false,
-            };
-            let mut magic = [0u8; 4];
-            if file.read_exact(&mut magic).is_ok() {
-                return magic == *b"\x7fELF";
-            }
-            false
-        })
+        .filter(|e| is_loadable_elf(e.path()))
         .map(|e| e.path().to_path_buf())
         .collect();
 
@@ -467,6 +476,72 @@ mod tests {
             new_mode & 0o777,
             "permissions should be preserved after patching"
         );
+    }
+
+    fn elf_header(data: u8, e_type: u16) -> Vec<u8> {
+        let mut header = b"\x7fELF".to_vec();
+        header.extend([2, data, 1]);
+        header.resize(16, 0);
+        match data {
+            2 => header.extend(e_type.to_be_bytes()),
+            _ => header.extend(e_type.to_le_bytes()),
+        }
+        header.resize(64, 0);
+        header
+    }
+
+    #[test]
+    fn loadable_elf_is_executables_and_shared_libraries() {
+        let tmp = TempDir::new().unwrap();
+        let cases: [(&str, Vec<u8>, bool); 8] = [
+            ("exec", elf_header(1, 2), true),
+            ("dyn", elf_header(1, 3), true),
+            ("dyn-big-endian", elf_header(2, 3), true),
+            ("rel", elf_header(1, 1), false),
+            ("rel-big-endian", elf_header(2, 1), false),
+            ("core", elf_header(1, 4), false),
+            ("unknown-encoding", elf_header(0, 3), false),
+            ("truncated", b"\x7fELF\x02\x01".to_vec(), false),
+        ];
+        for (name, bytes, expected) in cases {
+            let path = tmp.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(is_loadable_elf(&path), expected, "{name}");
+        }
+        let script = tmp.path().join("script");
+        fs::write(&script, "#!/bin/sh\necho hello world\n").unwrap();
+        assert!(!is_loadable_elf(&script));
+        assert!(!is_loadable_elf(&tmp.path().join("missing")));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn skips_cpp_objects_arwen_cannot_parse() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("object.cpp");
+        // A template and an inline function give the object COMDAT groups,
+        // which arwen rejects as an unsupported section type.
+        fs::write(
+            &src,
+            "template<class T> T id(T x) { return x; }\ninline int g() { static int s = 1; return s; }\nint use() { return id(1) + g(); }\n",
+        )
+        .unwrap();
+        let object = tmp.path().join("object.o");
+        let Ok(status) = Command::new("c++")
+            .arg("-c")
+            .arg(&src)
+            .arg("-o")
+            .arg(&object)
+            .status()
+        else {
+            eprintln!("Skipping C++ object test: c++ not found");
+            return;
+        };
+        assert!(status.success());
+
+        let data = fs::read(&object).unwrap();
+        assert!(arwen::elf::ElfContainer::parse(&data).is_err());
+        assert!(!is_loadable_elf(&object));
     }
 
     #[test]
