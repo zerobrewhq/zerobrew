@@ -44,7 +44,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Setup Homebrew
-        uses: Homebrew/actions/setup-homebrew@master
+        uses: Homebrew/actions/setup-homebrew@main
 
       - name: Get Homebrew version
         id: brew-version
