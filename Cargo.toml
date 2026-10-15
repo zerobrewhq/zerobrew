@@ -12,6 +12,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
+clap_mangen = "0.2"
 console = "0.16.2"
 indicatif = "0.18.3"
 reqwest = { version = "0.13.1", default-features = false, features = ["json", "stream", "rustls", "http2", "gzip"] }

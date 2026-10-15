@@ -177,6 +177,8 @@ pub enum Commands {
         )]
         shell: clap_complete::shells::Shell,
     },
+    /// Show the manual page of zb cli
+    Man,
     /// Run an installed formula as a command
     Run {
         #[arg(help = "Name of the formula to run")]

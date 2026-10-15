@@ -12,6 +12,7 @@ parity = []
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
 clap_complete = { workspace = true, features = ["unstable-dynamic"] }
+clap_mangen.workspace=true
 tokio = { workspace = true, features = ["full"] }
 indicatif.workspace = true
 console.workspace = true

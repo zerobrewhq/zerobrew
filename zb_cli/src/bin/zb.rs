@@ -32,6 +32,10 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
         return commands::completion::execute(shell);
     }
 
+    if let Commands::Man = cli.command {
+        return commands::man::execute();
+    }
+
     let root = get_root_path(cli.root);
     let prefix = get_prefix_path(cli.prefix, &root);
 
@@ -49,6 +53,7 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
         Commands::InstallAlias { .. } => unreachable!(),
         Commands::Init { .. } => unreachable!(),
         Commands::Completion { .. } => unreachable!(),
+        Commands::Man => unreachable!(),
         Commands::Install {
             formulas,
             no_link,
