@@ -1,8 +1,8 @@
 //! The two `openssl x509` questions the script asks of each keychain
-//! certificate: `-checkend 0`, whether it has expired, and whether
-//! `-purpose` reports `SSL server CA : Yes`. The second follows OpenSSL's
-//! `check_purpose_ssl_server` and `check_ca` in `crypto/x509/v3_purp.c`,
-//! which LibreSSL, the `openssl` on macOS, shares.
+//! certificate: whether `-checkend 0` fails, and whether `-purpose` reports
+//! `SSL server CA : Yes`. The `openssl` is `/usr/bin/openssl`, which on
+//! macOS is LibreSSL. Its `check_purpose_ssl_server` and `check_ca`
+//! (`x509_purp.c`) are OpenSSL's; its time handling is stricter.
 
 use x509_parser::oid_registry::OID_X509_EXT_CERT_TYPE;
 use x509_parser::prelude::*;
@@ -12,9 +12,20 @@ use x509_parser::prelude::*;
 const NS_SGC: &str = "2.16.840.1.113730.4.1";
 const MS_SGC: &str = "1.3.6.1.4.1.311.10.3.3";
 
-/// `openssl x509 -checkend 0`: expired once `notAfter` is not after `now`.
-pub(super) fn is_expired(cert: &X509Certificate, now: i64) -> bool {
-    cert.validity().not_after.timestamp() <= now
+/// Whether `openssl x509 -checkend 0` fails: `notAfter` is not after
+/// `now`, or LibreSSL will not read it at all. `X509_cmp_time` goes
+/// through `x509_verify_asn1_time_to_tm`, which applies RFC 5280 4.1.2.5:
+/// dates through 2049 must be UTCTime, later ones GeneralizedTime. A
+/// certificate that breaks the rule (Certum Trusted Network CA 2 encodes
+/// its 2046 expiry as GeneralizedTime) is reported as expiring.
+pub(super) fn fails_checkend(cert: &X509Certificate, now: i64) -> bool {
+    let not_after = &cert.validity().not_after;
+    let well_encoded = if not_after.to_datetime().year() < 2050 {
+        not_after.is_utctime()
+    } else {
+        not_after.is_generalizedtime()
+    };
+    !well_encoded || not_after.timestamp() <= now
 }
 
 /// Whether `openssl x509 -purpose` prints `SSL server CA : Yes`.
@@ -75,9 +86,11 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// Each fixture, whether it is an SSL server CA, and whether it has
-    /// expired. One per branch of `check_ca`.
+    /// Each fixture, whether it is an SSL server CA, and whether
+    /// `-checkend 0` fails. One per branch of `check_ca`, plus the root
+    /// whose expiry LibreSSL will not read.
     const CASES: &[(&str, bool, bool)] = &[
+        ("certum-trusted-network-ca-2.pem", true, true),
         ("root-ca.pem", true, false),
         ("v1-root.pem", true, false),
         ("ku-only.pem", true, false),
@@ -105,16 +118,26 @@ mod tests {
             let (_, pem) = parse_x509_pem(&pem).unwrap();
             let cert = pem.parse_x509().unwrap();
             assert_eq!(is_ssl_server_ca(&cert), *ssl_server_ca, "{name}");
-            assert_eq!(is_expired(&cert, now()), *expired, "{name}");
+            assert_eq!(fails_checkend(&cert, now()), *expired, "{name}");
         }
     }
 
+    /// Against the `openssl` the script runs: `/usr/bin/openssl` where it
+    /// exists, which on macOS is LibreSSL. OpenSSL reads the times LibreSSL
+    /// rejects, so `-checkend` is only compared with LibreSSL.
     #[test]
     fn agrees_with_openssl() {
-        let Ok(openssl) = which("openssl") else {
+        let openssl = std::path::PathBuf::from("/usr/bin/openssl");
+        let Ok(openssl) = (if openssl.is_file() {
+            Ok(openssl)
+        } else {
+            which("openssl")
+        }) else {
             eprintln!("skipping the openssl comparison: openssl not found");
             return;
         };
+        let version = Command::new(&openssl).arg("version").output().unwrap();
+        let libressl = String::from_utf8_lossy(&version.stdout).starts_with("LibreSSL");
         for (name, ssl_server_ca, expired) in CASES {
             let purpose = Command::new(&openssl)
                 .args(["x509", "-noout", "-purpose", "-in"])
@@ -127,12 +150,14 @@ mod tests {
                 *ssl_server_ca,
                 "{name}: {purpose}"
             );
-            let checkend = Command::new(&openssl)
-                .args(["x509", "-noout", "-checkend", "0", "-in"])
-                .arg(fixture(name))
-                .output()
-                .unwrap();
-            assert_eq!(!checkend.status.success(), *expired, "{name}");
+            if libressl {
+                let checkend = Command::new(&openssl)
+                    .args(["x509", "-noout", "-checkend", "0", "-in"])
+                    .arg(fixture(name))
+                    .output()
+                    .unwrap();
+                assert_eq!(!checkend.status.success(), *expired, "{name}");
+            }
         }
     }
 }
