@@ -651,4 +651,289 @@ end
             "keep:/opt/zb-extra"
         );
     }
+
+    /// Installs a fake "executable" (a /bin/sh script) into bin/ that echoes
+    /// back its argv and $SHELL, then reads stdin to EOF.
+    const FAKE_COMPLETION_TOOL: &str = r#"
+class Foo < Formula
+  def install
+    FileUtils.mkdir_p(prefix + "bin")
+    File.write(prefix + "bin" + "foo", <<~SH)
+      #!/bin/sh
+      echo "args:$*"
+      echo "shell-env:$SHELL"
+      cat
+    SH
+    FileUtils.chmod(0o755, prefix + "bin" + "foo")
+    __COMPLETION_CALL__
+    File.write(prefix + "installed", "ok")
+  end
+end
+"#;
+
+    async fn run_completions_formula(formula: &str, keg_files: &[&str]) -> tempfile::TempDir {
+        let ruby = find_ruby().await.expect("ruby required");
+        let tmp = tempfile::tempdir().unwrap();
+        let source_root = tmp.path().join("source");
+        std::fs::create_dir_all(&source_root).unwrap();
+
+        let prefix = tmp.path().join("prefix");
+        run_shim_formula(&ruby, &source_root, &prefix, formula)
+            .await
+            .unwrap();
+
+        let keg = prefix.join("Cellar").join("foo").join("1.0.0");
+        for rel in keg_files {
+            assert!(keg.join(rel).exists(), "missing completion file {rel}");
+        }
+        tmp
+    }
+
+    #[tokio::test]
+    async fn run_build_generate_completions_writes_all_shells() {
+        if find_ruby().await.is_err() {
+            return;
+        }
+        let formula = FAKE_COMPLETION_TOOL.replace(
+            "__COMPLETION_CALL__",
+            r#"generate_completions_from_executable(bin/"foo", "completions", shells: [:bash, :zsh, :fish])"#,
+        );
+        let tmp = run_completions_formula(
+            &formula,
+            &[
+                "etc/bash_completion.d/foo",
+                "share/zsh/site-functions/_foo",
+                "share/fish/vendor_completions.d/foo.fish",
+                "installed",
+            ],
+        )
+        .await;
+
+        let keg = tmp.path().join("prefix/Cellar/foo/1.0.0");
+        let bash = std::fs::read_to_string(keg.join("etc/bash_completion.d/foo")).unwrap();
+        assert!(bash.contains("args:completions bash"), "bash args: {bash}");
+        assert!(bash.contains("shell-env:bash"), "bash SHELL env: {bash}");
+        let zsh = std::fs::read_to_string(keg.join("share/zsh/site-functions/_foo")).unwrap();
+        assert!(zsh.contains("args:completions zsh"), "zsh args: {zsh}");
+        let fish =
+            std::fs::read_to_string(keg.join("share/fish/vendor_completions.d/foo.fish")).unwrap();
+        assert!(fish.contains("args:completions fish"), "fish args: {fish}");
+    }
+
+    #[tokio::test]
+    async fn run_build_generate_completions_default_shells_and_pwsh() {
+        if find_ruby().await.is_err() {
+            return;
+        }
+        // No shells: given -> defaults [:bash, :zsh, :fish].
+        let formula = FAKE_COMPLETION_TOOL.replace(
+            "__COMPLETION_CALL__",
+            r#"generate_completions_from_executable(bin/"foo", "completions")"#,
+        );
+        run_completions_formula(
+            &formula,
+            &[
+                "etc/bash_completion.d/foo",
+                "share/zsh/site-functions/_foo",
+                "share/fish/vendor_completions.d/foo.fish",
+            ],
+        )
+        .await;
+
+        // :cobra defaults include pwsh, and the argv parameter is "powershell"
+        // while $SHELL stays "pwsh".
+        let formula = FAKE_COMPLETION_TOOL.replace(
+            "__COMPLETION_CALL__",
+            r#"generate_completions_from_executable(bin/"foo", shell_parameter_format: :cobra)"#,
+        );
+        let tmp = run_completions_formula(
+            &formula,
+            &[
+                "etc/bash_completion.d/foo",
+                "share/zsh/site-functions/_foo",
+                "share/fish/vendor_completions.d/foo.fish",
+                "share/pwsh/completions/_foo.ps1",
+            ],
+        )
+        .await;
+        let keg = tmp.path().join("prefix/Cellar/foo/1.0.0");
+        let cobra = std::fs::read_to_string(keg.join("etc/bash_completion.d/foo")).unwrap();
+        assert!(
+            cobra.contains("args:completion bash"),
+            "cobra bash args: {cobra}"
+        );
+        let pwsh = std::fs::read_to_string(keg.join("share/pwsh/completions/_foo.ps1")).unwrap();
+        assert!(
+            pwsh.contains("args:completion powershell"),
+            "cobra pwsh args: {pwsh}"
+        );
+        assert!(pwsh.contains("shell-env:pwsh"), "pwsh SHELL env: {pwsh}");
+    }
+
+    #[tokio::test]
+    async fn run_build_generate_completions_shell_parameter_formats() {
+        if find_ruby().await.is_err() {
+            return;
+        }
+        let formula = FAKE_COMPLETION_TOOL.replace(
+            "__COMPLETION_CALL__",
+            r#"
+    generate_completions_from_executable(bin/"foo", shell_parameter_format: :arg, shells: [:bash], base_name: "arged")
+    generate_completions_from_executable(bin/"foo", shell_parameter_format: :flag, shells: [:zsh], base_name: "flagged")
+    generate_completions_from_executable(bin/"foo", shell_parameter_format: "--selected-shell=", shells: [:pwsh], base_name: "prefixed")
+    generate_completions_from_executable(bin/"foo", shell_parameter_format: :none, shells: [:fish], base_name: "plain")
+    generate_completions_from_executable(bin/"foo", shell_parameter_format: :clap, shells: [:bash], base_name: "clapped")
+    generate_completions_from_executable(bin/"foo", shells: ["bash"], base_name: "string-shell")"#,
+        );
+        let tmp = run_completions_formula(
+            &formula,
+            &[
+                "etc/bash_completion.d/arged",
+                "share/zsh/site-functions/_flagged",
+                "share/pwsh/completions/_prefixed.ps1",
+                "share/fish/vendor_completions.d/plain.fish",
+                "etc/bash_completion.d/clapped",
+                "etc/bash_completion.d/string-shell",
+            ],
+        )
+        .await;
+
+        let keg = tmp.path().join("prefix/Cellar/foo/1.0.0");
+        let read = |p: &str| std::fs::read_to_string(keg.join(p)).unwrap();
+        assert!(read("etc/bash_completion.d/arged").contains("args:--shell=bash"));
+        assert!(read("share/zsh/site-functions/_flagged").contains("args:--zsh"));
+        // A String prefix uses the raw shell symbol, not the powershell mapping.
+        assert!(
+            read("share/pwsh/completions/_prefixed.ps1").contains("args:--selected-shell=pwsh")
+        );
+        // :none and :clap add no argv; :clap passes the shell via COMPLETE.
+        let plain = read("share/fish/vendor_completions.d/plain.fish");
+        assert!(
+            plain.contains("args:\n"),
+            "none should add no argv: {plain}"
+        );
+        assert!(read("etc/bash_completion.d/clapped").contains("args:\n"));
+        // String shells are accepted (to_sym).
+        assert!(read("etc/bash_completion.d/string-shell").contains("args:bash"));
+    }
+
+    #[tokio::test]
+    async fn run_build_generate_completions_base_name_outside_bin() {
+        if find_ruby().await.is_err() {
+            return;
+        }
+        // Executable outside bin/ -> base_name falls back to the formula name.
+        let formula = r##"
+class Foo < Formula
+  def install
+    FileUtils.mkdir_p(buildpath + "tools")
+    File.write(buildpath + "tools" + "gen", "#!/bin/sh\necho \"args:$*\"\n")
+    FileUtils.chmod(0o755, buildpath + "tools" + "gen")
+    generate_completions_from_executable(buildpath + "tools" + "gen", shells: [:bash])
+  end
+end
+"##;
+        run_completions_formula(formula, &["etc/bash_completion.d/foo"]).await;
+    }
+
+    #[tokio::test]
+    async fn run_build_generate_completions_failure_aborts_install() {
+        let Some(ruby) = find_ruby().await.ok() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let source_root = tmp.path().join("source");
+        std::fs::create_dir_all(&source_root).unwrap();
+
+        let formula = r##"
+class Foo < Formula
+  def install
+    FileUtils.mkdir_p(prefix + "bin")
+    File.write(prefix + "bin" + "foo", "#!/bin/sh\nexit 3\n")
+    FileUtils.chmod(0o755, prefix + "bin" + "foo")
+    generate_completions_from_executable(bin/"foo", shells: [:bash])
+    File.write(prefix + "installed", "should-not-exist")
+  end
+end
+"##;
+
+        let prefix = tmp.path().join("prefix");
+        let err = run_shim_formula(&ruby, &source_root, &prefix, formula)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("failed"),
+            "error should report the failing command: {err}"
+        );
+        let keg = prefix.join("Cellar").join("foo").join("1.0.0");
+        assert!(!keg.join("installed").exists(), "install must not continue");
+        assert!(
+            !keg.join("etc/bash_completion.d/foo").exists(),
+            "no completion file on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_build_generate_completions_unspawnable_binary_fails_clearly() {
+        let Some(ruby) = find_ruby().await.ok() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let source_root = tmp.path().join("source");
+        std::fs::create_dir_all(&source_root).unwrap();
+
+        // ENOENT: the executable does not exist at all.
+        let formula = r#"
+class Foo < Formula
+  def install
+    generate_completions_from_executable(bin/"nope", shells: [:bash])
+  end
+end
+"#;
+        let prefix = tmp.path().join("prefix");
+        let err = run_shim_formula(&ruby, &source_root, &prefix, formula)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("failed"),
+            "ENOENT should surface as a clear failure: {err}"
+        );
+
+        // EACCES: the file exists but is not executable.
+        let formula = r##"
+class Foo < Formula
+  def install
+    FileUtils.mkdir_p(prefix + "bin")
+    File.write(prefix + "bin" + "foo", "#!/bin/sh\n")
+    generate_completions_from_executable(bin/"foo", shells: [:bash])
+  end
+end
+"##;
+        let prefix = tmp.path().join("prefix2");
+        let err = run_shim_formula(&ruby, &source_root, &prefix, formula)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("failed"),
+            "EACCES should surface as a clear failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_build_generate_completions_stdin_is_dev_null() {
+        if find_ruby().await.is_err() {
+            return;
+        }
+        // FAKE_COMPLETION_TOOL's script ends with `cat`: with stdin at
+        // /dev/null it reads EOF immediately instead of hanging on the
+        // terminal, and the completion file holds only the echoed lines.
+        let formula = FAKE_COMPLETION_TOOL.replace(
+            "__COMPLETION_CALL__",
+            r#"generate_completions_from_executable(bin/"foo", shells: [:bash])"#,
+        );
+        let tmp = run_completions_formula(&formula, &["etc/bash_completion.d/foo"]).await;
+        let keg = tmp.path().join("prefix/Cellar/foo/1.0.0");
+        let bash = std::fs::read_to_string(keg.join("etc/bash_completion.d/foo")).unwrap();
+        assert!(bash.contains("args:bash"), "cat saw EOF, no hang: {bash}");
+    }
 }

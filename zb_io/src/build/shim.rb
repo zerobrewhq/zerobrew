@@ -448,6 +448,7 @@ class Formula
   def bash_completion; prefix + "etc" + "bash_completion.d"; end
   def zsh_completion; share + "zsh" + "site-functions"; end
   def fish_completion; share + "fish" + "vendor_completions.d"; end
+  def pwsh_completion; share + "pwsh" + "completions"; end
   def elisp; share + "emacs" + "site-lisp" + name; end
 
   def resource(name)
@@ -491,6 +492,85 @@ class Formula
     puts "==> #{cmd}"
     result = Kernel.system(*args.map(&:to_s))
     exit 1 unless result
+  end
+
+  # Homebrew Formula#generate_completions_from_executable (formula.rb) via
+  # Utils::ShellCompletion (utils/shell_completion.rb). Runs the executable
+  # once per shell and writes its stdout to the completion script path.
+  # stdin is /dev/null and the parent environment is inherited (so with_env
+  # applies), matching Homebrew's Utils.popen_read. Failures abort the build
+  # like Formula#system does; nothing is written unless the run succeeds.
+  def generate_completions_from_executable(
+    *commands, base_name: nil, shell_parameter_format: nil, shells: nil
+  )
+    if commands.empty?
+      $stderr.puts "Error: generate_completions_from_executable requires a command"
+      exit 1
+    end
+
+    shells ||= case shell_parameter_format
+               when :cobra, :typer then [:bash, :zsh, :fish, :pwsh]
+               else [:bash, :zsh, :fish]
+               end
+
+    executable = commands.first.to_s
+    base_name ||= File.basename(executable) if executable.start_with?(bin.to_s, sbin.to_s)
+    base_name ||= name
+
+    paths = {
+      bash: bash_completion + base_name,
+      zsh: zsh_completion + "_#{base_name}",
+      fish: fish_completion + "#{base_name}.fish",
+      pwsh: pwsh_completion + "_#{base_name}.ps1",
+    }
+
+    shells.each do |shell|
+      shell = shell.to_sym
+      script_path = paths[shell]
+      unless script_path
+        $stderr.puts "Error: unsupported completion shell: #{shell}"
+        exit 1
+      end
+
+      # Go's cobra and Rust's clap accept "powershell"; SHELL stays "pwsh".
+      shell_parameter = (shell == :pwsh) ? "powershell" : shell.to_s
+      env = { "SHELL" => shell.to_s }
+      extra = case shell_parameter_format
+              when nil then [shell_parameter]
+              when :arg then ["--shell=#{shell_parameter}"]
+              when :clap
+                env["COMPLETE"] = shell_parameter
+                nil
+              when :click
+                prog_name = File.basename(executable).upcase.tr("-", "_")
+                env["_#{prog_name}_COMPLETE"] = "#{shell_parameter}_source"
+                nil
+              when :cobra then ["completion", shell_parameter]
+              when :flag then ["--#{shell_parameter}"]
+              when :none then nil
+              when :typer
+                env["_TYPER_COMPLETE_TEST_DISABLE_SHELL_DETECTION"] = "1"
+                ["--show-completion", shell_parameter]
+              # A String format is a parameter prefix; it uses the raw shell
+              # symbol, not the powershell-mapped name.
+              else ["#{shell_parameter_format}#{shell}"]
+              end
+
+      argv = commands.map(&:to_s) + Array(extra)
+      begin
+        output = IO.popen([env, *argv], "rb", in: File::NULL) { |io| io.read }
+        status = $?
+      rescue SystemCallError => e
+        $stderr.puts "Error: #{argv.join(" ")} failed: #{e.message}"
+        exit 1
+      end
+      unless status.success?
+        $stderr.puts "Error: #{argv.join(" ")} failed (#{status})"
+        exit 1
+      end
+
+      script_path.write(output)
+    end
   end
 
   def mv(*sources, **options)
