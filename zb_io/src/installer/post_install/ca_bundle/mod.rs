@@ -426,10 +426,10 @@ mod tests {
                 subject(b)
             );
         }
-        let fingerprints = |chunks: &[Vec<u8>]| -> std::collections::HashMap<[u8; 32], String> {
+        let fingerprints = |chunks: &[Vec<u8>]| -> std::collections::HashMap<[u8; 32], Vec<u8>> {
             chunks
                 .iter()
-                .filter_map(|c| pem::Certificate::parse(c).map(|p| (p.fingerprint, subject(c))))
+                .filter_map(|c| pem::Certificate::parse(c).map(|p| (p.fingerprint, c.clone())))
                 .collect()
         };
         let (ours_set, theirs_set) = (fingerprints(&ours_chunks), fingerprints(&theirs_chunks));
@@ -437,16 +437,85 @@ mod tests {
             ("ours", &ours_set, &theirs_set),
             ("theirs", &theirs_set, &ours_set),
         ] {
-            let only: Vec<&String> = mine
-                .iter()
-                .filter(|(fp, _)| !other.contains_key(*fp))
-                .map(|(_, subject)| subject)
-                .collect();
-            if !only.is_empty() {
-                report += &format!("only in {name}: {only:?}\n");
+            for (fingerprint, chunk) in mine {
+                if !other.contains_key(fingerprint) {
+                    report += &format!("only in {name}: {}\n{}", subject(chunk), probe(chunk));
+                }
             }
         }
         report
+    }
+
+    /// What each of the script's checks says about one certificate, next
+    /// to what this module says, so a disagreement names its cause.
+    #[cfg(target_os = "macos")]
+    fn probe(chunk: &[u8]) -> String {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("cert.pem");
+        fs::write(&file, chunk).unwrap();
+        let run = |program: &str, args: &[&str]| {
+            let output = Command::new(program)
+                .args(args)
+                .arg(&file)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = stdout
+                .lines()
+                .filter(|line| !line.contains(" : ") || line.starts_with("SSL server CA"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            format!(
+                "  {program} {}: exit {:?}; {stdout} {}\n",
+                args.join(" "),
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        };
+        let mut report = String::new();
+        report += &run(
+            "/usr/bin/openssl",
+            &["x509", "-inform", "pem", "-checkend", "0", "-noout", "-in"],
+        );
+        report += &run(
+            "/usr/bin/openssl",
+            &["x509", "-inform", "pem", "-purpose", "-noout", "-in"],
+        );
+        for policy in ["ssl", "basic"] {
+            report += &run(
+                "/usr/bin/security",
+                &[
+                    "verify-cert",
+                    "-l",
+                    "-L",
+                    "-p",
+                    policy,
+                    "-R",
+                    "offline",
+                    "-c",
+                ],
+            );
+        }
+        let certificate = pem::Certificate::parse(chunk).unwrap();
+        let x509 = certificate.x509();
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        report += &format!(
+            "  native: expired={} ssl_server_ca={} trusted(ssl)={:?} trusted(basic)={:?} der={} bytes\n",
+            purpose::is_expired(&x509, now),
+            purpose::is_ssl_server_ca(&x509),
+            macos::trusted(&[certificate.der.as_slice()], macos::Policy::Ssl),
+            macos::trusted(&[certificate.der.as_slice()], macos::Policy::Basic),
+            certificate.der.len()
+        );
+        report
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn probe(_chunk: &[u8]) -> String {
+        String::new()
     }
 
     #[test]
