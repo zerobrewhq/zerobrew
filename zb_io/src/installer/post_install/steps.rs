@@ -687,11 +687,14 @@ pub(super) fn command_path(ctx: &PostInstallContext) -> String {
     )
 }
 
-/// The environment a step command runs with: the prefix first on `PATH`
-/// and a private `HOME`, as under Homebrew's sandbox.
+/// The environment a step command runs with: the prefix first on `PATH`,
+/// a private `HOME`, and the C locale, so that what a step writes does not
+/// depend on the user's language settings. ca-certificates' script, for
+/// one, orders its bundle by a glob, which bash sorts by locale.
 pub(super) fn command_env(ctx: &PostInstallContext, home: &Path) -> Vec<(String, String)> {
     vec![
         ("PATH".into(), command_path(ctx)),
+        ("LC_ALL".into(), "C".into()),
         ("HOME".into(), home.display().to_string()),
         ("HOMEBREW_PREFIX".into(), ctx.prefix.display().to_string()),
         ("HOMEBREW_CELLAR".into(), ctx.cellar.display().to_string()),
