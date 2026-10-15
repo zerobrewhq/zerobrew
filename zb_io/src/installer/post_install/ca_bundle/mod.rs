@@ -9,6 +9,10 @@
 //! anything that depends on it, copies the bundle instead of rebuilding
 //! it. The bytes are the script's own: a miss runs it unchanged.
 
+// Not wired up yet: the in-process build that uses these comes last.
+#[allow(dead_code)]
+mod pem;
+
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
