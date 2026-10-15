@@ -59,13 +59,18 @@ impl CaBundle {
         if ctx.name != "ca-certificates" || args.len() != 2 {
             return None;
         }
-        if Path::new(program).file_name() != Some(OsStr::new("post-install")) {
+        let script = Path::new(program);
+        if script.file_name() != Some(OsStr::new("post-install")) {
             return None;
         }
         let mozilla = fs::read(&args[0]).ok()?;
+        let script_hash = fs::read(script)
+            .ok()
+            .map(|content| hex(&Sha256::digest(content)));
 
         let mut hasher = Sha256::new();
         hasher.update(&mozilla);
+        hasher.update(script_hash.as_deref().unwrap_or("unreadable script"));
         for source in TRUST_SOURCES {
             hasher.update(source.as_bytes());
             match fs::metadata(source) {
@@ -84,11 +89,7 @@ impl CaBundle {
         }
         #[cfg(target_os = "macos")]
         hasher.update(zb_core::macos_major_version().unwrap_or(0).to_le_bytes());
-        let key: String = hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        let key = hex(&hasher.finalize());
 
         Some(Self {
             destination: PathBuf::from(&args[1]),
@@ -125,6 +126,10 @@ impl CaBundle {
         fs::set_permissions(&self.destination, fs::Permissions::from_mode(0o644))
             .map_err(StepError::io("setting bundle mode"))
     }
+}
+
+fn hex(digest: &[u8]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -209,6 +214,21 @@ mod tests {
             fs::read_to_string(&destination).unwrap(),
             "MOZILLA v2\nbuilt\n"
         );
+    }
+
+    #[test]
+    fn the_script_is_part_of_the_cache_key() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = context(tmp.path(), "ca-certificates", "2026-09-25");
+        let script = install_script(&ctx);
+        let source = ctx.keg.join("share/ca-certificates/cacert.pem");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "MOZILLA\n").unwrap();
+        let args = [source.display().to_string(), "b".to_string()];
+        let first = CaBundle::detect(&ctx, script.as_os_str(), &args).unwrap();
+        fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        let second = CaBundle::detect(&ctx, script.as_os_str(), &args).unwrap();
+        assert_ne!(first.cached, second.cached);
     }
 
     #[test]
