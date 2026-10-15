@@ -101,12 +101,7 @@ impl CaBundle {
         let Ok(content) = fs::read(&self.cached) else {
             return Ok(false);
         };
-        if let Some(parent) = self.destination.parent() {
-            fs::create_dir_all(parent).map_err(StepError::io("creating directory"))?;
-        }
-        write_atomically(&self.destination, &content)?;
-        fs::set_permissions(&self.destination, fs::Permissions::from_mode(0o644))
-            .map_err(StepError::io("setting bundle mode"))?;
+        self.write(&content)?;
         Ok(true)
     }
 
@@ -119,6 +114,16 @@ impl CaBundle {
             fs::create_dir_all(parent).map_err(StepError::io("creating cache directory"))?;
         }
         write_atomically(&self.cached, &content)
+    }
+
+    /// `mkdir -p`, `mv -f` and `chmod 0644`, as the script ends.
+    fn write(&self, content: &[u8]) -> Result<(), StepError> {
+        if let Some(parent) = self.destination.parent() {
+            fs::create_dir_all(parent).map_err(StepError::io("creating directory"))?;
+        }
+        write_atomically(&self.destination, content)?;
+        fs::set_permissions(&self.destination, fs::Permissions::from_mode(0o644))
+            .map_err(StepError::io("setting bundle mode"))
     }
 }
 
