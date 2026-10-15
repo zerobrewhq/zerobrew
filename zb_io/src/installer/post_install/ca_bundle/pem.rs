@@ -37,6 +37,22 @@ pub(super) fn split_certificates(input: &[u8]) -> Vec<Vec<u8>> {
     certificates
 }
 
+/// The certificates of `input` in the order the script handles them. Its
+/// `awk` writes them to `1.pem`, `2.pem`, ... and the loops then go over
+/// `"$output_dir"/*.pem`, which bash sorts as strings: `1`, `10`, `100`,
+/// `101`, ... `11`, ... `2`, and so on. That is the order under `LC_ALL=C`,
+/// which the step environment sets.
+pub(super) fn certificates(input: &[u8]) -> Vec<Vec<u8>> {
+    let chunks = split_certificates(input);
+    let mut order: Vec<usize> = (0..chunks.len()).collect();
+    order.sort_by_cached_key(|index| format!("{}.pem", index + 1));
+    let mut chunks: Vec<Option<Vec<u8>>> = chunks.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|index| chunks[index].take().expect("each index once"))
+        .collect()
+}
+
 fn contains(line: &[u8], needle: &[u8]) -> bool {
     memchr::memmem::find(line, needle).is_some()
 }
@@ -106,7 +122,7 @@ impl Bundle {
     /// The script's `append_bundle`: every certificate in `input` that
     /// `openssl` can read, once each.
     pub(super) fn append_bundle(&mut self, input: &[u8]) {
-        for chunk in split_certificates(input) {
+        for chunk in certificates(input) {
             if let Some(certificate) = Certificate::parse(&chunk) {
                 self.append_unique(&certificate);
             }
@@ -223,6 +239,55 @@ pub(super) mod tests {
             assert_eq!(&fs::read(&file).unwrap(), chunk, "chunk {}", index + 1);
         }
         assert!(!tmp.path().join("8.pem").exists());
+    }
+
+    #[test]
+    fn orders_certificates_like_the_glob_does() {
+        // Twelve certificates: enough for 10, 11 and 12 to sort before 2.
+        let mut bundle = Vec::new();
+        for _ in 0..4 {
+            bundle.extend_from_slice(ROOT_CA);
+            bundle.extend_from_slice(LEAF);
+            bundle.extend_from_slice(V1_ROOT);
+        }
+        let in_order = split_certificates(&bundle);
+        let globbed = certificates(&bundle);
+        assert_eq!(globbed.len(), 12);
+        let expected_order = [1, 10, 11, 12, 2, 3, 4, 5, 6, 7, 8, 9];
+        for (position, number) in expected_order.into_iter().enumerate() {
+            assert_eq!(
+                globbed[position],
+                in_order[number - 1],
+                "position {position}"
+            );
+        }
+
+        let Ok(bash) = which("bash") else {
+            eprintln!("skipping the bash comparison: bash not found");
+            return;
+        };
+        let tmp = TempDir::new().unwrap();
+        for (index, chunk) in in_order.iter().enumerate() {
+            fs::write(tmp.path().join(format!("{}.pem", index + 1)), chunk).unwrap();
+        }
+        let output = Command::new(bash)
+            .args([
+                "-c",
+                "for f in \"$1\"/*.pem; do printf '%s\\n' \"${f##*/}\"; done",
+                "--",
+            ])
+            .arg(tmp.path())
+            .env_clear()
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        let listed: Vec<String> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        let expected: Vec<String> = expected_order.iter().map(|n| format!("{n}.pem")).collect();
+        assert_eq!(listed, expected);
     }
 
     #[test]
