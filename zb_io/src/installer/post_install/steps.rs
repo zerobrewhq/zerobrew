@@ -677,19 +677,21 @@ fn create_symlink(source: &Path, link: &Path, force: bool) -> Result<(), StepErr
     symlink(source, link).map_err(StepError::io(format!("linking {}", link.display())))
 }
 
+/// The `PATH` a step command runs with: the prefix first, then the system's.
+pub(super) fn command_path(ctx: &PostInstallContext) -> String {
+    let system_path = std::env::var("PATH").unwrap_or_default();
+    format!(
+        "{}:{}:{system_path}",
+        ctx.prefix.join("bin").display(),
+        ctx.prefix.join("sbin").display()
+    )
+}
+
 /// The environment a step command runs with: the prefix first on `PATH`
 /// and a private `HOME`, as under Homebrew's sandbox.
-fn command_env(ctx: &PostInstallContext, home: &Path) -> Vec<(String, String)> {
-    let system_path = std::env::var("PATH").unwrap_or_default();
+pub(super) fn command_env(ctx: &PostInstallContext, home: &Path) -> Vec<(String, String)> {
     vec![
-        (
-            "PATH".into(),
-            format!(
-                "{}:{}:{system_path}",
-                ctx.prefix.join("bin").display(),
-                ctx.prefix.join("sbin").display()
-            ),
-        ),
+        ("PATH".into(), command_path(ctx)),
         ("HOME".into(), home.display().to_string()),
         ("HOMEBREW_PREFIX".into(), ctx.prefix.display().to_string()),
         ("HOMEBREW_CELLAR".into(), ctx.cellar.display().to_string()),
