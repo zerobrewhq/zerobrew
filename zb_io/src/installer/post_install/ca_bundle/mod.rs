@@ -219,7 +219,7 @@ fn append_keychain(
         .filter_map(|chunk| pem::Certificate::parse(chunk))
         .filter(|certificate| {
             let x509 = certificate.x509();
-            !purpose::is_expired(&x509, now) && purpose::is_ssl_server_ca(&x509)
+            !purpose::fails_checkend(&x509, now) && purpose::is_ssl_server_ca(&x509)
         })
         .collect();
     let ders: Vec<&[u8]> = candidates.iter().map(|c| c.der.as_slice()).collect();
@@ -504,7 +504,7 @@ mod tests {
             .as_secs() as i64;
         report += &format!(
             "  native: expired={} ssl_server_ca={} trusted(ssl)={:?} trusted(basic)={:?} der={} bytes\n",
-            purpose::is_expired(&x509, now),
+            purpose::fails_checkend(&x509, now),
             purpose::is_ssl_server_ca(&x509),
             macos::trusted(&[certificate.der.as_slice()], macos::Policy::Ssl),
             macos::trusted(&[certificate.der.as_slice()], macos::Policy::Basic),
