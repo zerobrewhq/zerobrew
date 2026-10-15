@@ -12,6 +12,8 @@
 // Not wired up yet: the in-process build that uses these comes last.
 #[allow(dead_code)]
 mod pem;
+#[allow(dead_code)]
+mod purpose;
 
 use std::ffi::OsStr;
 use std::fs;
