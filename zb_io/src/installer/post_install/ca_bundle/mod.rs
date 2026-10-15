@@ -10,6 +10,9 @@
 //! it. The bytes are the script's own: a miss runs it unchanged.
 
 // Not wired up yet: the in-process build that uses these comes last.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+mod macos;
 #[allow(dead_code)]
 mod pem;
 #[allow(dead_code)]
