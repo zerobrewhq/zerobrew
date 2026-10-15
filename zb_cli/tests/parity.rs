@@ -585,12 +585,37 @@ fn ca_certificates_bundle_matches_homebrew() {
         .unwrap_or_else(|e| panic!("Homebrew wrote no {bundle}: {e}"));
     let ours =
         fs::read(zb.prefix().join(bundle)).unwrap_or_else(|e| panic!("zb wrote no {bundle}: {e}"));
-    assert!(
-        reference == ours,
-        "{bundle} differs: {} bytes from Homebrew, {} from zb",
-        reference.len(),
-        ours.len()
-    );
+    if reference != ours {
+        let same = reference
+            .iter()
+            .zip(&ours)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let line = reference[..same].iter().filter(|b| **b == b'\n').count() + 1;
+        let count = |bytes: &[u8]| {
+            String::from_utf8_lossy(bytes)
+                .matches("-----BEGIN CERTIFICATE-----")
+                .count()
+        };
+        let excerpt = |bytes: &[u8]| {
+            String::from_utf8_lossy(bytes)
+                .lines()
+                .skip(line.saturating_sub(3))
+                .take(5)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        panic!(
+            "{bundle} differs: {} bytes and {} certificates from Homebrew, {} bytes and {} from zb; \
+             first difference at line {line}\n--- Homebrew\n{}\n--- zb\n{}",
+            reference.len(),
+            count(&reference),
+            ours.len(),
+            count(&ours),
+            excerpt(&reference),
+            excerpt(&ours)
+        );
+    }
 }
 
 /// The symlinks Homebrew creates in the prefix for a keg, keyed by their path

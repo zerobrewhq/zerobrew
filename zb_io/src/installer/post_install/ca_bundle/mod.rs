@@ -388,22 +388,65 @@ mod tests {
         let bundle = CaBundle::detect(&ctx, script.as_os_str(), &args).unwrap();
         assert!(bundle.script_is_known);
         let native = bundle.build_bytes(&ctx).unwrap();
-        if native != expected {
-            let dump = std::env::temp_dir().join("zb-ca-bundle");
-            fs::create_dir_all(&dump).unwrap();
-            fs::write(dump.join("script.pem"), &expected).unwrap();
-            fs::write(dump.join("native.pem"), &native).unwrap();
-            fs::copy(&source, dump.join("mozilla.pem")).unwrap();
-            eprintln!("both bundles written under {}", dump.display());
-        }
         assert!(
             native == expected,
-            "the in-process bundle differs from the script's: {} vs {} bytes, {} vs {} certificates",
-            native.len(),
-            expected.len(),
-            pem::split_certificates(&native).len(),
-            pem::split_certificates(&expected).len()
+            "the in-process bundle differs from the script's: {}",
+            describe_difference(&native, &expected)
         );
+    }
+
+    /// Where two bundles differ: the sizes, the first certificate that
+    /// differs, and the certificates only one side has.
+    fn describe_difference(ours: &[u8], theirs: &[u8]) -> String {
+        let subject = |chunk: &[u8]| {
+            pem::Certificate::parse(chunk)
+                .map(|c| c.x509().subject().to_string())
+                .unwrap_or_else(|| "<unreadable>".to_string())
+        };
+        let ours_chunks = pem::split_certificates(ours);
+        let theirs_chunks = pem::split_certificates(theirs);
+        let mut report = format!(
+            "{} vs {} bytes, {} vs {} certificates\n",
+            ours.len(),
+            theirs.len(),
+            ours_chunks.len(),
+            theirs_chunks.len()
+        );
+        if let Some((index, (a, b))) = ours_chunks
+            .iter()
+            .zip(&theirs_chunks)
+            .enumerate()
+            .find(|(_, (a, b))| a != b)
+        {
+            report += &format!(
+                "first difference at certificate {index}: ours {} bytes, {}; theirs {} bytes, {}\n",
+                a.len(),
+                subject(a),
+                b.len(),
+                subject(b)
+            );
+        }
+        let fingerprints = |chunks: &[Vec<u8>]| -> std::collections::HashMap<[u8; 32], String> {
+            chunks
+                .iter()
+                .filter_map(|c| pem::Certificate::parse(c).map(|p| (p.fingerprint, subject(c))))
+                .collect()
+        };
+        let (ours_set, theirs_set) = (fingerprints(&ours_chunks), fingerprints(&theirs_chunks));
+        for (name, mine, other) in [
+            ("ours", &ours_set, &theirs_set),
+            ("theirs", &theirs_set, &ours_set),
+        ] {
+            let only: Vec<&String> = mine
+                .iter()
+                .filter(|(fp, _)| !other.contains_key(*fp))
+                .map(|(_, subject)| subject)
+                .collect();
+            if !only.is_empty() {
+                report += &format!("only in {name}: {only:?}\n");
+            }
+        }
+        report
     }
 
     #[test]
