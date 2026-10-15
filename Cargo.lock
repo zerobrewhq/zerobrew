@@ -3023,6 +3023,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "rustls-native-certs",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2",
