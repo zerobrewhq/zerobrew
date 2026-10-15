@@ -62,6 +62,7 @@ fn contains(line: &[u8], needle: &[u8]) -> bool {
 pub(super) struct Certificate<'a> {
     /// The chunk, which is what the script appends to the bundle.
     pub(super) text: &'a [u8],
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(super) der: Vec<u8>,
     pub(super) fingerprint: [u8; 32],
 }
@@ -89,6 +90,7 @@ impl<'a> Certificate<'a> {
         })
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(super) fn x509(&self) -> X509Certificate<'_> {
         X509Certificate::from_der(&self.der)
             .map(|(_, cert)| cert)

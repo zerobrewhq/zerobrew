@@ -149,6 +149,11 @@ pub(super) fn run_step(
                 && bundle.restore()?
             {
                 debug!("restored the CA bundle from the cache");
+            } else if let Some(bundle) = &bundle
+                && bundle.build(ctx)?
+            {
+                debug!("built the CA bundle in process");
+                bundle.store()?;
             } else {
                 run_command(
                     ctx,
