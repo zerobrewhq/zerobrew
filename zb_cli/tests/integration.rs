@@ -213,6 +213,20 @@ fn test_curl_keg_only() {
 
 #[test]
 #[ignore = "integration test"]
+fn test_tap_source_build_with_class_level_build_options() {
+    let t = TestEnv::new();
+
+    // https://github.com/xo/homebrew-xo/blob/master/Formula/usql.rb
+    // Source-only tap formula that calls `build.with?` in the class body.
+    assert_success(&t.zb(&["install", "xo/xo/usql"]), "zb install xo/xo/usql");
+
+    let output = t.run_binary("usql", &["--version"]);
+    assert_success(&output, "usql --version");
+    assert_stdout_contains(&output, "usql ");
+}
+
+#[test]
+#[ignore = "integration test"]
 fn test_install_uninstall_and_reinstall() {
     let t = TestEnv::new();
 
