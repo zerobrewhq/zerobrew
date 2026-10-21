@@ -102,6 +102,10 @@ pub(super) struct Certificate<'a> {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(super) der: Vec<u8>,
     pub(super) fingerprint: [u8; 32],
+    /// SHA-256 of the SubjectPublicKeyInfo, in hex: what
+    /// `openssl x509 -pubkey | openssl pkey -pubin -outform der | openssl
+    /// dgst -sha256 -r` prints, which the 2026-10-20 script drops roots by.
+    pub(super) key_hash: String,
 }
 
 impl<'a> Certificate<'a> {
@@ -114,9 +118,15 @@ impl<'a> Certificate<'a> {
         }
         // The fingerprint covers the certificate only, as OpenSSL's does,
         // not anything that follows it in the block.
-        let used = X509Certificate::from_der(&pem.contents)
-            .ok()
-            .map(|(rest, _)| pem.contents.len() - rest.len())?;
+        let (used, key_hash) =
+            X509Certificate::from_der(&pem.contents)
+                .ok()
+                .map(|(rest, cert)| {
+                    (
+                        pem.contents.len() - rest.len(),
+                        hex(&Sha256::digest(cert.public_key().raw)),
+                    )
+                })?;
         let mut der = pem.contents;
         der.truncate(used);
         let fingerprint = Sha256::digest(&der).into();
@@ -124,6 +134,7 @@ impl<'a> Certificate<'a> {
             text,
             der,
             fingerprint,
+            key_hash,
         })
     }
 
@@ -136,16 +147,31 @@ impl<'a> Certificate<'a> {
 }
 
 /// The bundle under construction and the fingerprints already in it.
-#[derive(Default)]
 pub(super) struct Bundle {
     fingerprints: HashSet<[u8; 32]>,
+    /// Keys the script drops on sight, by hex SHA-256 of the
+    /// SubjectPublicKeyInfo: the `case` in `append_unique_certificate`
+    /// that the 2026-10-20 script added. Empty for the older script.
+    excluded_keys: &'static [&'static str],
     content: Vec<u8>,
 }
 
 impl Bundle {
+    pub(super) fn new(excluded_keys: &'static [&'static str]) -> Self {
+        Self {
+            fingerprints: HashSet::new(),
+            excluded_keys,
+            content: Vec::new(),
+        }
+    }
+
     /// The script's `append_unique_certificate`: add `certificate` unless
-    /// one with the same fingerprint is already in.
+    /// its key is one the script excludes or one with the same fingerprint
+    /// is already in.
     pub(super) fn append_unique(&mut self, certificate: &Certificate) {
+        if self.excluded_keys.contains(&certificate.key_hash.as_str()) {
+            return;
+        }
         if self.fingerprints.insert(certificate.fingerprint) {
             self.append_raw(certificate.text);
         }
@@ -177,6 +203,10 @@ impl Bundle {
     }
 }
 
+pub(super) fn hex(digest: &[u8]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -190,6 +220,13 @@ pub(super) mod tests {
         include_bytes!("../../../../fixtures/ca-bundle/leaf.pem");
     pub(in super::super) const V1_ROOT: &[u8] =
         include_bytes!("../../../../fixtures/ca-bundle/v1-root.pem");
+    /// Two of the roots the 2026-10-20 script drops by key: Comodo's AAA
+    /// Certificate Services, still in Apple's root store, and emSign ECC
+    /// Root CA - G3, still in the Mozilla bundle.
+    pub(in super::super) const AAA_CERTIFICATE_SERVICES: &[u8] =
+        include_bytes!("../../../../fixtures/ca-bundle/aaa-certificate-services.pem");
+    pub(in super::super) const EMSIGN_ECC_ROOT_G3: &[u8] =
+        include_bytes!("../../../../fixtures/ca-bundle/emsign-ecc-root-ca-g3.pem");
 
     /// The `split_certificates` function of the script, verbatim.
     const AWK: &str = r#"
@@ -392,7 +429,7 @@ pub(super) mod tests {
 
     #[test]
     fn the_bundle_keeps_each_readable_certificate_once() {
-        let mut bundle = Bundle::default();
+        let mut bundle = Bundle::new(&[]);
         bundle.append_bundle(&awkward_bundle()).unwrap();
         let mut expected = Vec::new();
         for text in [ROOT_CA.to_vec(), crlf(LEAF), V1_ROOT.to_vec()] {
@@ -401,9 +438,64 @@ pub(super) mod tests {
         }
         assert_eq!(bundle.into_bytes(), expected);
 
-        let mut raw = Bundle::default();
+        let mut raw = Bundle::new(&[]);
         raw.append_raw(b"anything\n");
         assert_eq!(raw.into_bytes(), b"anything\n\n");
+    }
+
+    /// The key hash is what the script's `openssl` pipeline prints, and a
+    /// bundle built for the 2026-10-20 script drops the roots it names.
+    #[test]
+    fn drops_the_keys_the_script_excludes() {
+        use super::super::EXCLUDED_KEYS_2026_10_20;
+        let aaa = Certificate::parse(AAA_CERTIFICATE_SERVICES).unwrap();
+        let emsign = Certificate::parse(EMSIGN_ECC_ROOT_G3).unwrap();
+        assert_eq!(
+            aaa.key_hash,
+            "bd153ed7b0434f6886b17bce8bbe84ed340c7132d702a8f4fa318f756ecbd6f3"
+        );
+        assert_eq!(
+            emsign.key_hash,
+            "8d417db2dd8bf5e3084d1e3f196d583849d81bdd4c00c70b9d39369e96b8c782"
+        );
+        assert!(EXCLUDED_KEYS_2026_10_20.contains(&aaa.key_hash.as_str()));
+        assert!(EXCLUDED_KEYS_2026_10_20.contains(&emsign.key_hash.as_str()));
+        assert!(
+            !EXCLUDED_KEYS_2026_10_20
+                .contains(&Certificate::parse(ROOT_CA).unwrap().key_hash.as_str())
+        );
+
+        let mut input = Vec::new();
+        for text in [AAA_CERTIFICATE_SERVICES, ROOT_CA, EMSIGN_ECC_ROOT_G3] {
+            input.extend_from_slice(text);
+        }
+        let mut older = Bundle::new(&[]);
+        older.append_bundle(&input).unwrap();
+        assert_eq!(split_certificates(&older.into_bytes()).len(), 3);
+        let mut newer = Bundle::new(EXCLUDED_KEYS_2026_10_20);
+        newer.append_bundle(&input).unwrap();
+        let kept = newer.into_bytes();
+        assert_eq!(split_certificates(&kept), [ROOT_CA.to_vec()]);
+
+        let Ok(openssl) = which("openssl") else {
+            eprintln!("skipping the openssl comparison: openssl not found");
+            return;
+        };
+        let pipeline = format!(
+            "{0} x509 -inform pem -pubkey -noout | {0} pkey -pubin -outform der | {0} dgst -sha256 -r",
+            openssl.display()
+        );
+        let output = Command::new("sh")
+            .args(["-c", &pipeline])
+            .stdin(fs::File::open(fixture("aaa-certificate-services.pem")).unwrap())
+            .output()
+            .unwrap();
+        let printed = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            printed.starts_with(&aaa.key_hash),
+            "{printed} should start with {}",
+            aaa.key_hash
+        );
     }
 
     /// What does not parse here is dropped only where `openssl` would
@@ -432,7 +524,7 @@ pub(super) mod tests {
             .into_bytes();
         assert!(Certificate::parse(&indented).is_none());
         assert!(!surely_rejected(&indented));
-        let mut bundle = Bundle::default();
+        let mut bundle = Bundle::new(&[]);
         assert_eq!(bundle.append_bundle(&indented), Err(Unreadable));
         assert!(bundle.into_bytes().is_empty());
     }

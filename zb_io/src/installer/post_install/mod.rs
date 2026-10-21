@@ -17,6 +17,7 @@
 //! is also what Homebrew does.
 
 mod ca_bundle;
+pub use ca_bundle::known_ca_bundle_script;
 mod clang;
 mod paths;
 mod steps;

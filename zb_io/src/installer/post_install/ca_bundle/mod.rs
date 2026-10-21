@@ -37,20 +37,58 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use sha2::{Digest, Sha256};
-use tracing::{debug, warn};
+use tracing::warn;
 
-use self::pem::Bundle;
+use self::pem::{Bundle, hex};
 use super::steps::write_atomically;
 use super::{PostInstallContext, StepError};
 
-/// SHA-256 of each `libexec/post-install` this module reproduces. The
-/// script is written by the formula's `install`; a new hash means reading
-/// its diff, updating the port if it changed, and adding the hash.
-///
-/// - `0d382c72`: Formula/c/ca-certificates.rb as of 2026-09-25
-///   (homebrew-core a48f632d)
-const KNOWN_SCRIPTS: &[&str] =
-    &["0d382c7231f5f0378947729c5815f7fb8f6c12c16396172513109b13bd59b900"];
+/// A `libexec/post-install` this module reproduces, by SHA-256, and what
+/// it does that an earlier one did not. The script is written by the
+/// formula's `install`; a new hash means reading its diff against the last
+/// fixture, extending the port if the behaviour changed, and adding a row
+/// here and a fixture under `fixtures/ca-bundle`.
+struct KnownScript {
+    hash: &'static str,
+    /// The keys its `append_unique_certificate` drops, if any.
+    excluded_keys: &'static [&'static str],
+}
+
+/// The SubjectPublicKeyInfo hashes the 2026-10-20 script excludes: AAA
+/// Certificate Services (Comodo) and the two emSign G3 roots.
+pub(super) const EXCLUDED_KEYS_2026_10_20: &[&str] = &[
+    "bd153ed7b0434f6886b17bce8bbe84ed340c7132d702a8f4fa318f756ecbd6f3",
+    "c619e4780ed8e0abeda24ad732567de4383a7ea941338f6d1a7d1b49ac792fe9",
+    "8d417db2dd8bf5e3084d1e3f196d583849d81bdd4c00c70b9d39369e96b8c782",
+];
+
+const KNOWN_SCRIPTS: &[KnownScript] = &[
+    // ca-certificates 2026-09-25 (homebrew-core a48f632d).
+    KnownScript {
+        hash: "0d382c7231f5f0378947729c5815f7fb8f6c12c16396172513109b13bd59b900",
+        excluded_keys: &[],
+    },
+    // ca-certificates 2026-10-20: drops three roots by key.
+    KnownScript {
+        hash: "da9391b40cabf30802bab7f27cfbdd4292bbc79155a4731e671526351ee24825",
+        excluded_keys: EXCLUDED_KEYS_2026_10_20,
+    },
+];
+
+fn known_script(hash: &str) -> Option<&'static KnownScript> {
+    KNOWN_SCRIPTS.iter().find(|script| script.hash == hash)
+}
+
+/// Whether `script` is a `libexec/post-install` this module builds in
+/// process. The parity harness checks the installed bottle's, so an
+/// upstream change shows up as a failing nightly rather than as the script
+/// quietly running again.
+pub fn known_ca_bundle_script(script: &Path) -> bool {
+    fs::read(script)
+        .ok()
+        .and_then(|content| known_script(&hex(&Sha256::digest(content))))
+        .is_some()
+}
 
 /// The system trust stores the script reads, in the order it reads them.
 #[cfg(target_os = "macos")]
@@ -68,10 +106,11 @@ const TRUST_SOURCES: &[&str] = &[
 
 pub(super) struct CaBundle {
     script: PathBuf,
+    script_hash: Option<String>,
+    known: Option<&'static KnownScript>,
     source: PathBuf,
     destination: PathBuf,
     cached: PathBuf,
-    script_is_known: bool,
 }
 
 impl CaBundle {
@@ -122,10 +161,11 @@ impl CaBundle {
 
         Some(Self {
             script: script.to_path_buf(),
+            known: script_hash.as_deref().and_then(known_script),
+            script_hash,
             source: PathBuf::from(&args[0]),
             destination: PathBuf::from(&args[1]),
             cached: ctx.cache.join("ca-certificates").join(format!("{key}.pem")),
-            script_is_known: script_hash.is_some_and(|hash| KNOWN_SCRIPTS.contains(&hash.as_str())),
         })
     }
 
@@ -142,11 +182,15 @@ impl CaBundle {
     /// script is not one this module reproduces, or the build failed: the
     /// script then runs as it would have.
     pub(super) fn build(&self, ctx: &PostInstallContext) -> Result<bool, StepError> {
-        if !self.script_is_known {
-            debug!(script = %self.script.display(), "unknown post-install script; running it");
+        let Some(known) = self.known else {
+            warn!(
+                script = %self.script.display(),
+                hash = self.script_hash.as_deref().unwrap_or("unreadable"),
+                "ca-certificates' post-install script is not one zerobrew knows; running it instead of building the bundle in process"
+            );
             return Ok(false);
-        }
-        let content = match self.build_bytes(ctx) {
+        };
+        let content = match self.build_bytes(ctx, known) {
             Ok(content) => content,
             Err(error) => {
                 warn!(%error, "cannot build the CA bundle in process; running the script");
@@ -178,11 +222,15 @@ impl CaBundle {
             .map_err(StepError::io("setting bundle mode"))
     }
 
-    /// The bytes the script would write.
-    fn build_bytes(&self, ctx: &PostInstallContext) -> Result<Vec<u8>, StepError> {
+    /// The bytes `known` would write.
+    fn build_bytes(
+        &self,
+        ctx: &PostInstallContext,
+        known: &KnownScript,
+    ) -> Result<Vec<u8>, StepError> {
         let mozilla =
             fs::read(&self.source).map_err(StepError::io("reading the Mozilla bundle"))?;
-        let mut bundle = Bundle::default();
+        let mut bundle = Bundle::new(known.excluded_keys);
         append_system_certificates(ctx, &mut bundle, &mozilla)?;
         Ok(bundle.into_bytes())
     }
@@ -305,22 +353,21 @@ fn unreadable(source: &str) -> StepError {
     ))
 }
 
-fn hex(digest: &[u8]) -> String {
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::steps::{command_env, run_step};
     use super::super::test_support::context;
-    use super::pem::tests::{awkward_bundle, fixture, which};
+    use super::pem::tests::{
+        AAA_CERTIFICATE_SERVICES, EMSIGN_ECC_ROOT_G3, awkward_bundle, fixture, which,
+    };
     use super::*;
     use std::collections::BTreeMap;
     use std::process::Command;
     use tempfile::TempDir;
     use zb_core::{PathBase, PathSpec, StepAction, Sudo};
 
-    const SCRIPT: &str = "post-install-0d382c72.sh";
+    /// The fixtures, one per row of [`KNOWN_SCRIPTS`], in the same order.
+    const SCRIPTS: &[&str] = &["post-install-0d382c72.sh", "post-install-da9391b4.sh"];
 
     /// A stand-in for the real script: counts its runs and writes the
     /// source bundle to the destination with a marker.
@@ -336,13 +383,22 @@ mod tests {
         script
     }
 
-    /// The real script, as the bottle ships it.
-    fn install_real_script(ctx: &PostInstallContext) -> PathBuf {
+    /// A real script, as a bottle ships it.
+    fn install_real_script(ctx: &PostInstallContext, name: &str) -> PathBuf {
         let script = ctx.keg.join("libexec/post-install");
         fs::create_dir_all(script.parent().unwrap()).unwrap();
-        fs::copy(fixture(SCRIPT), &script).unwrap();
+        fs::copy(fixture(name), &script).unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         script
+    }
+
+    /// The awkward bundle plus two roots the newer script drops by key.
+    fn bundle_with_excluded_roots() -> Vec<u8> {
+        let mut bundle = awkward_bundle();
+        bundle.extend_from_slice(b"\nAAA Certificate Services\n");
+        bundle.extend_from_slice(AAA_CERTIFICATE_SERVICES);
+        bundle.extend_from_slice(EMSIGN_ECC_ROOT_G3);
+        bundle
     }
 
     fn bundle_step() -> StepAction {
@@ -376,13 +432,16 @@ mod tests {
 
     #[test]
     fn the_known_scripts_are_the_fixtures() {
-        let content = fs::read(fixture(SCRIPT)).unwrap();
-        let hash = hex(&Sha256::digest(&content));
-        assert!(
-            KNOWN_SCRIPTS.contains(&hash.as_str()),
-            "{SCRIPT} hashes to {hash}"
-        );
-        assert!(SCRIPT.contains(&hash[..8]));
+        assert_eq!(SCRIPTS.len(), KNOWN_SCRIPTS.len());
+        for (name, known) in SCRIPTS.iter().zip(KNOWN_SCRIPTS) {
+            let content = fs::read(fixture(name)).unwrap();
+            let hash = hex(&Sha256::digest(&content));
+            assert_eq!(known.hash, hash, "{name} hashes to {hash}");
+            assert!(name.contains(&hash[..8]));
+            assert!(known_ca_bundle_script(&fixture(name)));
+        }
+        assert!(!known_ca_bundle_script(&fixture("root-ca.pem")));
+        assert!(!known_ca_bundle_script(Path::new("/nonexistent")));
     }
 
     /// The reason this module may exist: on the same inputs, the bundle
@@ -395,38 +454,50 @@ mod tests {
             eprintln!("skipping the script comparison: bash or awk not found");
             return;
         };
-        let tmp = TempDir::new().unwrap();
-        let ctx = context(tmp.path(), "ca-certificates", "2026-09-25");
-        let script = install_real_script(&ctx);
-        let source = mozilla_source(&ctx, &awkward_bundle());
-        let expected = tmp.path().join("script/cert.pem");
-        let output = Command::new(bash)
-            .arg(&script)
-            .arg(&source)
-            .arg(&expected)
-            .env_clear()
-            .envs(command_env(&ctx, &ctx.temp))
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "the script failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let expected = fs::read(expected).unwrap();
-        assert!(!pem::split_certificates(&expected).is_empty());
+        let mut outputs = Vec::new();
+        for name in SCRIPTS {
+            let tmp = TempDir::new().unwrap();
+            let ctx = context(tmp.path(), "ca-certificates", "2026-09-25");
+            let script = install_real_script(&ctx, name);
+            let source = mozilla_source(&ctx, &bundle_with_excluded_roots());
+            let expected = tmp.path().join("script/cert.pem");
+            let output = Command::new(&bash)
+                .arg(&script)
+                .arg(&source)
+                .arg(&expected)
+                .env_clear()
+                .envs(command_env(&ctx, &ctx.temp))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{name} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let expected = fs::read(expected).unwrap();
+            assert!(!pem::split_certificates(&expected).is_empty());
 
-        let args = [
-            source.display().to_string(),
-            tmp.path().join("native/cert.pem").display().to_string(),
-        ];
-        let bundle = CaBundle::detect(&ctx, script.as_os_str(), &args, &BTreeMap::new()).unwrap();
-        assert!(bundle.script_is_known);
-        let native = bundle.build_bytes(&ctx).unwrap();
-        assert!(
-            native == expected,
-            "the in-process bundle differs from the script's: {}",
-            describe_difference(&native, &expected)
+            let args = [
+                source.display().to_string(),
+                tmp.path().join("native/cert.pem").display().to_string(),
+            ];
+            let bundle =
+                CaBundle::detect(&ctx, script.as_os_str(), &args, &BTreeMap::new()).unwrap();
+            let known = bundle.known.expect("the fixture is a known script");
+            let native = bundle.build_bytes(&ctx, known).unwrap();
+            assert!(
+                native == expected,
+                "the in-process bundle differs from {name}'s: {}",
+                describe_difference(&native, &expected)
+            );
+            outputs.push(expected);
+        }
+        // The two scripts do differ on this input: the newer one drops the
+        // excluded roots, so matching both is not matching by accident.
+        assert_ne!(outputs[0], outputs[1]);
+        assert_eq!(
+            pem::split_certificates(&outputs[0]).len(),
+            pem::split_certificates(&outputs[1]).len() + 2
         );
     }
 
@@ -557,7 +628,7 @@ mod tests {
     fn a_known_script_is_built_in_process_and_cached() {
         let tmp = TempDir::new().unwrap();
         let ctx = context(tmp.path(), "ca-certificates", "2026-09-25");
-        install_real_script(&ctx);
+        install_real_script(&ctx, SCRIPTS[0]);
         mozilla_source(&ctx, &awkward_bundle());
         let destination = ctx.prefix.join("etc/ca-certificates/cert.pem");
 
@@ -671,7 +742,7 @@ mod tests {
         let args = [source.display().to_string(), "b".to_string()];
         let bundle = CaBundle::detect(&ctx, OsStr::new("post-install"), &args, &no_env).unwrap();
         assert!(
-            !bundle.script_is_known,
+            bundle.known.is_none() && bundle.script_hash.is_none(),
             "an unreadable script is not a known one"
         );
         assert!(CaBundle::detect(&ctx, OsStr::new("post-install"), &args[..1], &no_env).is_none());
