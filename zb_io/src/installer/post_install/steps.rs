@@ -144,11 +144,16 @@ pub(super) fn run_step(
                 .iter()
                 .map(|arg| expand(ctx, arg))
                 .collect::<Result<Vec<_>, _>>()?;
-            let bundle = CaBundle::detect(ctx, &program, &args);
+            let bundle = CaBundle::detect(ctx, &program, &args, env);
             if let Some(bundle) = &bundle
                 && bundle.restore()?
             {
                 debug!("restored the CA bundle from the cache");
+            } else if let Some(bundle) = &bundle
+                && bundle.build(ctx)?
+            {
+                debug!("built the CA bundle in process");
+                bundle.store()?;
             } else {
                 run_command(
                     ctx,
@@ -677,19 +682,24 @@ fn create_symlink(source: &Path, link: &Path, force: bool) -> Result<(), StepErr
     symlink(source, link).map_err(StepError::io(format!("linking {}", link.display())))
 }
 
-/// The environment a step command runs with: the prefix first on `PATH`
-/// and a private `HOME`, as under Homebrew's sandbox.
-fn command_env(ctx: &PostInstallContext, home: &Path) -> Vec<(String, String)> {
+/// The `PATH` a step command runs with: the prefix first, then the system's.
+pub(super) fn command_path(ctx: &PostInstallContext) -> String {
     let system_path = std::env::var("PATH").unwrap_or_default();
+    format!(
+        "{}:{}:{system_path}",
+        ctx.prefix.join("bin").display(),
+        ctx.prefix.join("sbin").display()
+    )
+}
+
+/// The environment a step command runs with: the prefix first on `PATH`,
+/// a private `HOME`, and the C locale, so that what a step writes does not
+/// depend on the user's language settings. ca-certificates' script, for
+/// one, orders its bundle by a glob, which bash sorts by locale.
+pub(super) fn command_env(ctx: &PostInstallContext, home: &Path) -> Vec<(String, String)> {
     vec![
-        (
-            "PATH".into(),
-            format!(
-                "{}:{}:{system_path}",
-                ctx.prefix.join("bin").display(),
-                ctx.prefix.join("sbin").display()
-            ),
-        ),
+        ("PATH".into(), command_path(ctx)),
+        ("LC_ALL".into(), "C".into()),
         ("HOME".into(), home.display().to_string()),
         ("HOMEBREW_PREFIX".into(), ctx.prefix.display().to_string()),
         ("HOMEBREW_CELLAR".into(), ctx.cellar.display().to_string()),
