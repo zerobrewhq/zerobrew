@@ -78,6 +78,8 @@ else
     : "${ZEROBREW_PREFIX:=$ZEROBREW_ROOT/prefix}"
 fi
 
+# Pass the actual binary destination to zb init so shell config agrees.
+export ZEROBREW_BIN
 export ZEROBREW_ROOT
 export ZEROBREW_PREFIX
 

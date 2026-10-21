@@ -95,7 +95,10 @@ pub fn run_init(
             format!("{}/.zerobrew", home)
         }
     };
-    let zerobrew_bin = format!("{}/bin", zerobrew_dir);
+    let zerobrew_bin = std::env::var("ZEROBREW_BIN")
+        .ok()
+        .filter(|bin| !bin.is_empty())
+        .unwrap_or_else(|| format!("{}/bin", zerobrew_dir));
 
     let dirs_to_create: Vec<PathBuf> = vec![
         root.to_path_buf(),
@@ -481,6 +484,10 @@ end
                     posix_shell_quote(zerobrew_dir)
                 ))?;
                 ui.println(format!(
+                    "    export ZEROBREW_BIN={}",
+                    posix_shell_quote(zerobrew_bin)
+                ))?;
+                ui.println(format!(
                     "    export ZEROBREW_ROOT={}",
                     posix_shell_quote(&root_str)
                 ))?;
@@ -500,6 +507,10 @@ end
                 ui.println(format!(
                     "    set -gx ZEROBREW_DIR {}",
                     fish_shell_quote(zerobrew_dir)
+                ))?;
+                ui.println(format!(
+                    "    set -gx ZEROBREW_BIN {}",
+                    fish_shell_quote(zerobrew_bin)
                 ))?;
                 ui.println(format!(
                     "    set -gx ZEROBREW_ROOT {}",

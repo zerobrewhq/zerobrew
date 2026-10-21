@@ -7,12 +7,14 @@ on:
       - '**/*.rs'
       - '**/Cargo.toml'
       - 'Cargo.lock'
+      - 'install.sh'
       - '.github/workflows/test.yml'
   pull_request:
     paths:
       - '**/*.rs'
       - '**/Cargo.toml'
       - 'Cargo.lock'
+      - 'install.sh'
       - '.github/workflows/test.yml'
 
 jobs:
