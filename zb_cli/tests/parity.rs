@@ -580,6 +580,15 @@ fn ca_certificates_bundle_matches_homebrew() {
     let Some((brew, zb)) = install_both(case("ca-certificates")) else {
         return;
     };
+    let script = zb_keg(&zb, "ca-certificates").join("libexec/post-install");
+    assert!(
+        zb_io::installer::post_install::known_ca_bundle_script(&script),
+        "ca-certificates' post-install script changed upstream: diff {} against the newest \
+         fixture in zb_io/fixtures/ca-bundle, extend the port if it needs it, and add the \
+         hash to KNOWN_SCRIPTS in zb_io/src/installer/post_install/ca_bundle/mod.rs",
+        script.display()
+    );
+
     let bundle = "etc/ca-certificates/cert.pem";
     let reference = fs::read(brew.prefix.join(bundle))
         .unwrap_or_else(|e| panic!("Homebrew wrote no {bundle}: {e}"));
