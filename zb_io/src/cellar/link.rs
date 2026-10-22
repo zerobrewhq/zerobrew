@@ -7,7 +7,15 @@ use zb_core::{ConflictedLink, Error};
 /// Keg directories linked into the prefix. Like Homebrew, `libexec` is not
 /// linked: it holds files private to a keg, like the Python formulae's
 /// unversioned `python` and `pip`, which would collide across versions.
-const LINK_DIRS: &[&str] = &["bin", "sbin", "lib", "include", "share", "etc"];
+const LINK_DIRS: &[&str] = &[
+    "bin",
+    "sbin",
+    "lib",
+    "include",
+    "share",
+    "etc",
+    "Frameworks",
+];
 
 /// Directories older versions of zerobrew linked. Still unlinked, so those
 /// links are cleaned up on uninstall and upgrade.
@@ -139,8 +147,20 @@ fn dir_mode(top: &str, rel: &str) -> DirMode {
             DirMode::Mkpath
         }
         "lib" => DirMode::Link,
+        // Homebrew creates `Foo.framework` and `Foo.framework/Versions` so
+        // several kegs can link their versions into one framework, and links
+        // everything else, such as `Versions/3.13`, as a whole.
+        "Frameworks" if is_framework_or_versions(rel) => DirMode::Mkpath,
+        "Frameworks" => DirMode::Link,
         _ => DirMode::Mkpath,
     }
+}
+
+/// Whether `rel`, a path inside `Frameworks`, ends in a `.framework` bundle or
+/// its `Versions` directory. Homebrew's `[^/]*\.framework(/Versions)?$`.
+fn is_framework_or_versions(rel: &str) -> bool {
+    let bundle = rel.strip_suffix("/Versions").unwrap_or(rel);
+    bundle.ends_with(".framework")
 }
 
 /// Files Homebrew leaves out of the prefix: generated caches that every keg
@@ -278,8 +298,10 @@ impl Linker {
         fs::create_dir_all(&bin_dir)?;
         fs::create_dir_all(&opt_dir)?;
 
+        // `Frameworks` is created on first use: most prefixes, and every
+        // Linux one, never get a framework.
         for dir in LINK_DIRS {
-            if *dir != "bin" {
+            if *dir != "bin" && *dir != "Frameworks" {
                 fs::create_dir_all(prefix.join(dir))?;
             }
         }
@@ -919,6 +941,68 @@ mod tests {
         linker.link_keg(&keg).unwrap();
 
         assert!(tmp.path().join("sbin/php-fpm").is_symlink());
+    }
+
+    /// Homebrew links a keg's `Frameworks` like its other directories:
+    /// `Foo.framework` and `Foo.framework/Versions` are created so several
+    /// kegs can share them, and a version directory, the `Current` link and
+    /// the bundle's top-level links are linked as they are. See
+    /// https://github.com/zerobrewhq/zerobrew/issues/414
+    #[test]
+    fn links_frameworks_the_way_homebrew_does() {
+        let tmp = TempDir::new().unwrap();
+        let prefix = tmp.path();
+        let keg = prefix.join("cellar/python@3.13/3.13.9");
+        let framework = keg.join("Frameworks/Python.framework");
+        fs::create_dir_all(framework.join("Versions/3.13/Headers")).unwrap();
+        fs::write(framework.join("Versions/3.13/Python"), b"dylib").unwrap();
+        fs::write(framework.join("Versions/3.13/Headers/Python.h"), b"h").unwrap();
+        std::os::unix::fs::symlink("3.13", framework.join("Versions/Current")).unwrap();
+        std::os::unix::fs::symlink("Versions/Current/Python", framework.join("Python")).unwrap();
+        std::os::unix::fs::symlink("Versions/Current/Headers", framework.join("Headers")).unwrap();
+
+        let linker = Linker::new(prefix).unwrap();
+        linker.link_keg(&keg).unwrap();
+
+        let linked = prefix.join("Frameworks/Python.framework");
+        for dir in [&linked, &linked.join("Versions")] {
+            assert!(
+                dir.is_dir() && !dir.is_symlink(),
+                "{} should be a real directory",
+                dir.display()
+            );
+        }
+        for link in ["Versions/3.13", "Versions/Current", "Python", "Headers"] {
+            assert!(linked.join(link).is_symlink(), "{link} should be linked");
+        }
+        assert_eq!(fs::read(linked.join("Python")).unwrap(), b"dylib");
+        assert!(linked.join("Headers/Python.h").is_file());
+
+        linker.unlink_keg(&keg).unwrap();
+        assert!(linked.join("Versions/3.13").symlink_metadata().is_err());
+        assert!(linked.join("Python").symlink_metadata().is_err());
+        assert!(!linked.exists(), "the created framework dirs are removed");
+    }
+
+    /// A prefix gets a `Frameworks` directory only once a keg links into it.
+    #[test]
+    fn frameworks_dir_is_created_on_first_use() {
+        let tmp = TempDir::new().unwrap();
+        Linker::new(tmp.path()).unwrap();
+        assert!(!tmp.path().join("Frameworks").exists());
+    }
+
+    #[test]
+    fn framework_dirs_are_recognised() {
+        assert!(is_framework_or_versions("Python.framework"));
+        assert!(is_framework_or_versions("Python.framework/Versions"));
+        assert!(!is_framework_or_versions("Python.framework/Versions/3.13"));
+        assert!(!is_framework_or_versions("Python.framework/Headers"));
+        assert!(!is_framework_or_versions("Versions"));
+        assert!(is_framework_or_versions(
+            "A.framework/Versions/A/Frameworks/B.framework"
+        ));
+        assert!(!is_framework_or_versions("A.framework/Versions/Versions"));
     }
 
     /// Homebrew links `include/<pkg>` and `share/doc/<pkg>` as one symlink

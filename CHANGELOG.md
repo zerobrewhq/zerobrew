@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - The Homebrew tap is `zerobrewhq/tap`: `brew install zerobrewhq/tap/zerobrew`. The repository was renamed from `homebrew-zerobrew`, so taps of `zerobrewhq/zerobrew` and `cachebag/zerobrew` keep updating through GitHub's redirect
 
+### Fixed
+- A keg's `Frameworks` directory is linked into the prefix, as Homebrew does, so Python's framework build on macOS shows up in the prefix's `Frameworks`. `Foo.framework` and its `Versions` directory are created and shared, everything below them is linked as a whole ([#414](https://github.com/zerobrewhq/zerobrew/issues/414))
+
 ## [0.4.2] - 2026-10-21
 
 ### Added

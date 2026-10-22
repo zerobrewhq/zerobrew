@@ -631,7 +631,16 @@ fn ca_certificates_bundle_matches_homebrew() {
 /// relative to the prefix, with targets relative to the prefix too.
 fn links_into(prefix: &Path, keg: &Path) -> BTreeMap<String, String> {
     let mut links = BTreeMap::new();
-    for dir in ["bin", "sbin", "lib", "include", "share", "etc", "opt"] {
+    for dir in [
+        "bin",
+        "sbin",
+        "lib",
+        "include",
+        "share",
+        "etc",
+        "Frameworks",
+        "opt",
+    ] {
         let root = prefix.join(dir);
         if !root.exists() {
             continue;
