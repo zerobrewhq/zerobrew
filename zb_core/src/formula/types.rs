@@ -224,6 +224,14 @@ impl Formula {
         }
     }
 
+    pub fn install_dependencies(&self, build_from_source: bool) -> Vec<String> {
+        let mut deps = self.runtime_dependencies();
+        if build_from_source {
+            deps.extend(self.all_build_dependencies());
+        }
+        deps
+    }
+
     fn platform_dependencies(&self) -> Vec<String> {
         #[cfg(target_os = "linux")]
         if let Some(deps) = self.variation_dependencies(preferred_linux_variation_keys()) {

@@ -213,20 +213,6 @@ fn test_curl_keg_only() {
 
 #[test]
 #[ignore = "integration test"]
-fn test_tap_source_build_with_class_level_build_options() {
-    let t = TestEnv::new();
-
-    // https://github.com/xo/homebrew-xo/blob/master/Formula/usql.rb
-    // Source-only tap formula that calls `build.with?` in the class body.
-    assert_success(&t.zb(&["install", "xo/xo/usql"]), "zb install xo/xo/usql");
-
-    let output = t.run_binary("usql", &["--version"]);
-    assert_success(&output, "usql --version");
-    assert_stdout_contains(&output, "usql ");
-}
-
-#[test]
-#[ignore = "integration test"]
 fn test_install_uninstall_and_reinstall() {
     let t = TestEnv::new();
 
@@ -312,6 +298,17 @@ fn test_gc_removes_unused_store_entries() {
 
     assert_success(&t.zb(&["gc"]), "zb gc");
     assert_eq!(t.count_store_entries(), 0);
+}
+
+#[test]
+#[ignore = "integration test"]
+fn test_install_build_from_source() {
+    let t = TestEnv::new();
+    assert_success(
+        &t.zb(&["install", "--build-from-source", "adzimzf/tpot/a-test"]),
+        "zb install --build-from-source adzimzf/tpot/a-test",
+    );
+    assert_success(&t.run_binary("a-test", &["--version"]), "a-test --version");
 }
 
 #[test]

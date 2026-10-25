@@ -497,7 +497,6 @@ class Formula
     exit 1 unless result
   end
 
-<<<<<<< HEAD
   # Homebrew Formula#generate_completions_from_executable (formula.rb) via
   # Utils::ShellCompletion (utils/shell_completion.rb). Runs the executable
   # once per shell and writes its stdout to the completion script path.
@@ -575,6 +574,7 @@ class Formula
 
       script_path.write(output)
     end
+  end
 
   def cd(dir, &block)
     dir = dir.respond_to?(:to_path) ? dir.to_path : dir.to_s
