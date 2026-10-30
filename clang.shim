@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/data/data/com.termux/files/usr/bin/bash
 # clang shim for Termux: rewrites the unversioned Android target triple
 # (aarch64-linux-android) to the versioned one (aarch64-linux-android24)
 # that newer Termux clang requires.
