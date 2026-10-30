@@ -49,6 +49,11 @@ default:
 build: fmt-check lint
     cargo build --bin zb --bin zbx --bin zb-brew
 
+[doc('Build the zb binary')]
+[group('build')]
+build-android: fmt-check lint
+    cargo build --features=android-support --bin zb --bin zbx --bin zb-brew
+
 [doc('Install zb to $ZEROBREW_BIN')]
 [group('install')]
 [script]
@@ -218,6 +223,11 @@ lint:
 [group('test')]
 test:
     cargo test --workspace -- --include-ignored
+
+[doc('Run all tests for Android (enables android-support feature)')]
+[group('test')]
+test-android: build-android
+    cargo test --workspace --features=android-support -- --include-ignored
 
 [doc('Benchmark zerobrew against Homebrew (resets zerobrew; see --help)')]
 [group('benchmark')]
