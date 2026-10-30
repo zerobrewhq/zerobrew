@@ -52,9 +52,11 @@ build: fmt-check lint
 [doc('Build the zb binary')]
 [group('build')]
 build-android: fmt-check lint
-    CFLAGS_aarch64_linux_android="--target=aarch64-linux-android24 -I/data/data/com.termux/files/usr/include" \
+    CC_aarch64_linux_android=./clang.shim \
+    CXX_aarch64_linux_android=./clang.shim \
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=./clang.shim \
     PKG_CONFIG_ALLOW_CROSS=1 \
-    PKG_CONFIG_PATH=/data/data/com.termux/files/usr/lib/pkgconfig \
+    PKG_CONFIG_PATH=$TERMUX__PREFIX/lib/pkgconfig \
     cargo build --features=android-support --bin zb --bin zbx --bin zb-brew
 
 [doc('Install zb to $ZEROBREW_BIN')]
@@ -230,9 +232,11 @@ test:
 [doc('Run all tests for Android (enables android-support feature)')]
 [group('test')]
 test-android: build-android
-    CFLAGS_aarch64_linux_android="--target=aarch64-linux-android24 -I/data/data/com.termux/files/usr/include" \
+    CC_aarch64_linux_android=./clang.shim \
+    CXX_aarch64_linux_android=./clang.shim \
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=./clang.shim \
     PKG_CONFIG_ALLOW_CROSS=1 \
-    PKG_CONFIG_PATH=/data/data/com.termux/files/usr/lib/pkgconfig \
+    PKG_CONFIG_PATH=$TERMUX__PREFIX/lib/pkgconfig \
     cargo test --workspace --features=android-support -- --include-ignored
 
 [doc('Benchmark zerobrew against Homebrew (resets zerobrew; see --help)')]
