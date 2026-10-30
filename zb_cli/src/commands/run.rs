@@ -89,11 +89,18 @@ pub async fn execute(
             cmd.env("SSL_CERT_DIR", &ca_dir);
         }
 
-        let lib_path = prefix_path.join("lib");
+        let termux_prefix = std::env::var("PREFIX").ok();
+        let lib_dirs = run_lib_dirs(&prefix_path, termux_prefix.as_deref());
+
+        let lib_path = lib_dirs
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(":");
         if let Ok(existing_ld_path) = std::env::var("LD_LIBRARY_PATH") {
             cmd.env(
                 "LD_LIBRARY_PATH",
-                format!("{}:{}", lib_path.display(), existing_ld_path),
+                format!("{}:{}", lib_path, existing_ld_path),
             );
         } else {
             cmd.env("LD_LIBRARY_PATH", lib_path);
@@ -105,6 +112,16 @@ pub async fn execute(
     Err(zb_core::Error::ExecutionError {
         message: format!("failed to execute '{}': {}", formula, err),
     })
+}
+
+/// Library directories to expose via LD_LIBRARY_PATH when running a bottle.
+pub fn run_lib_dirs(prefix_path: &Path, termux_prefix: Option<&str>) -> Vec<PathBuf> {
+    let mut dirs = vec![prefix_path.join("lib")];
+    #[cfg(target_os = "android")]
+    if let Some(tp) = termux_prefix {
+        dirs.push(std::path::PathBuf::from(tp).join("glibc/lib"));
+    }
+    dirs
 }
 
 fn detect_runtime_prefix(bin_path: &Path) -> Option<PathBuf> {
@@ -412,6 +429,12 @@ mod tests {
         let bin_path = PathBuf::from("/tmp/prefix/Cellar/foo/1.0.0/bin/foo");
         let detected = detect_runtime_prefix_with_env(&bin_path, Some("/env/prefix"));
         assert_eq!(detected, Some(PathBuf::from("/env/prefix")));
+    }
+
+    #[test]
+    fn run_lib_dirs_includes_prefix_lib() {
+        let dirs = run_lib_dirs(Path::new("/opt/zb/prefix"), None);
+        assert!(dirs.iter().any(|p| p == Path::new("/opt/zb/prefix/lib")));
     }
 
     #[test]
