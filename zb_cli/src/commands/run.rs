@@ -105,21 +105,24 @@ pub async fn execute(
             cmd.env("SSL_CERT_DIR", &ca_dir);
         }
 
-        let termux_prefix = std::env::var("PREFIX").ok();
-        let lib_dirs = run_lib_dirs(&prefix_path, termux_prefix.as_deref());
+        #[cfg(not(target_os = "android"))]
+        {
+            let termux_prefix = std::env::var("PREFIX").ok();
+            let lib_dirs = run_lib_dirs(&prefix_path, termux_prefix.as_deref());
 
-        let lib_path = lib_dirs
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(":");
-        if let Ok(existing_ld_path) = std::env::var("LD_LIBRARY_PATH") {
-            cmd.env(
-                "LD_LIBRARY_PATH",
-                format!("{}:{}", lib_path, existing_ld_path),
-            );
-        } else {
-            cmd.env("LD_LIBRARY_PATH", lib_path);
+            let lib_path = lib_dirs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(":");
+            if let Ok(existing_ld_path) = std::env::var("LD_LIBRARY_PATH") {
+                cmd.env(
+                    "LD_LIBRARY_PATH",
+                    format!("{}:{}", lib_path, existing_ld_path),
+                );
+            } else {
+                cmd.env("LD_LIBRARY_PATH", lib_path);
+            }
         }
     }
 
