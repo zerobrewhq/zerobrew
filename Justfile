@@ -51,14 +51,15 @@ build: fmt-check lint
 
 [doc('Build the zb binary')]
 [group('build')]
-build-android:
-    cargo fmt --all -- --check
+lint-android:
     CC_aarch64_linux_android={{justfile_directory()}}/clang.shim \
     CXX_aarch64_linux_android={{justfile_directory()}}/clang.shim \
     CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER={{justfile_directory()}}/clang.shim \
     PKG_CONFIG_ALLOW_CROSS=1 \
     PKG_CONFIG_PATH=$TERMUX__PREFIX/lib/pkgconfig \
     cargo clippy --workspace -- -D warnings
+
+build-android: fmt-check lint-android
     CC_aarch64_linux_android={{justfile_directory()}}/clang.shim \
     CXX_aarch64_linux_android={{justfile_directory()}}/clang.shim \
     CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER={{justfile_directory()}}/clang.shim \
