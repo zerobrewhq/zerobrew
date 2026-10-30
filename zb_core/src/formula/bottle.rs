@@ -222,6 +222,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    #[allow(unused_variables)]
     fn selects_platform_bottle() {
         let fixture = include_str!("../../fixtures/formula_foo.json");
         let formula: Formula = serde_json::from_str(fixture).unwrap();

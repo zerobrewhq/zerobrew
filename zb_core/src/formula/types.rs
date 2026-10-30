@@ -262,7 +262,7 @@ impl Formula {
         self.uses_from_macos.clone()
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn variation_uses_from_macos(&self, keys: &[&str]) -> Option<Vec<UsesFromMacos>> {
         let variations = self.variations.as_ref()?.as_object()?;
         for key in keys {
