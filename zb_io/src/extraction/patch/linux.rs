@@ -14,7 +14,10 @@ use super::text;
 const LINUX_HOMEBREW_PREFIX: &str = "/home/linuxbrew/.linuxbrew";
 
 /// Patch @@HOMEBREW_CELLAR@@ and @@HOMEBREW_PREFIX@@ placeholders in both ELF binaries and text files.
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "android")]
+use zb_core::platform::termux;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn patch_placeholders(
     keg_path: &Path,
     prefix_dir: &Path,
@@ -35,6 +38,7 @@ fn rewrite_homebrew_prefixes(input: &str, prefix_dir: &Path) -> String {
         .replace(LINUX_HOMEBREW_PREFIX, &prefix_str)
 }
 
+#[cfg(target_os = "linux")]
 /// Detect if zerobrew has installed its own glibc and return the path to its ld.so interpreter.
 /// Returns None if zerobrew's glibc is not found, indicating we should use the system ld.so.
 fn detect_zerobrew_glibc(prefix_dir: &Path) -> Option<PathBuf> {
@@ -103,6 +107,7 @@ fn detect_zerobrew_glibc(prefix_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "linux")]
 /// Find the system's dynamic linker (ld.so).
 /// Returns the path to the system ld.so if found, None otherwise.
 fn find_system_ld_so() -> Option<PathBuf> {
@@ -155,13 +160,24 @@ fn is_loadable_elf(path: &Path) -> bool {
 fn patch_elf_placeholders(keg_path: &Path, prefix_dir: &Path) -> Result<(), Error> {
     let lib_path = prefix_dir.join("lib").to_string_lossy().to_string();
 
-    // Detect if zerobrew has installed its own glibc
+    // Determine which interpreter to use.
+    #[cfg(target_os = "android")]
+    let target_interpreter: Option<PathBuf> = {
+        match termux::termux_glibc_ready_message() {
+            Ok(ld) => Some(ld),
+            Err(msg) => {
+                return Err(Error::StoreCorruption {
+                    message: format!("failed to prepare bottle for Android/Termux: {msg}"),
+                });
+            }
+        }
+    };
+
+    #[cfg(target_os = "linux")]
     let zerobrew_interpreter = detect_zerobrew_glibc(prefix_dir);
 
-    // Determine which interpreter to use:
-    // - If zerobrew has glibc, use zerobrew's ld.so
-    // - Otherwise, use the system ld.so (fallback)
-    let target_interpreter = if let Some(ref zb_ld) = zerobrew_interpreter {
+    #[cfg(target_os = "linux")]
+    let target_interpreter: Option<PathBuf> = if let Some(ref zb_ld) = zerobrew_interpreter {
         Some(zb_ld.clone())
     } else {
         // Find system ld.so - common paths for Linux
@@ -276,7 +292,14 @@ fn patch_elf_placeholders(keg_path: &Path, prefix_dir: &Path) -> Result<(), Erro
                     if expanded_path.exists() {
                         Some(expanded_path)
                     } else {
-                        find_system_ld_so()
+                        #[cfg(target_os = "linux")]
+                        {
+                            find_system_ld_so()
+                        }
+                        #[cfg(target_os = "android")]
+                        {
+                            target_interpreter.clone()
+                        }
                     }
                 } else {
                     target_interpreter.clone()
@@ -388,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn rewrites_linuxbrew_prefixes() {
         let tmp = TempDir::new().unwrap();
         let prefix = tmp.path().join("prefix");
@@ -407,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn patches_text_files() {
         let tmp = TempDir::new().unwrap();
         let prefix = tmp.path().join("prefix");
@@ -441,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn patches_elf_file() {
         let tmp = TempDir::new().unwrap();
         let prefix = tmp.path().join("prefix");
@@ -515,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn skips_cpp_objects_arwen_cannot_parse() {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("object.cpp");
