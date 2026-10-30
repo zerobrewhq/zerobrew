@@ -51,7 +51,7 @@ build: fmt-check lint
 
 [doc('Build the zb binary')]
 [group('build')]
-build-android: fmt-check lint
+build-android:
     CC_aarch64_linux_android=./clang.shim \
     CXX_aarch64_linux_android=./clang.shim \
     CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=./clang.shim \
