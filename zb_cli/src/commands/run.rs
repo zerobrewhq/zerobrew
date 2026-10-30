@@ -76,8 +76,24 @@ pub async fn execute(
         style(&formula).green()
     );
 
-    let mut cmd = Command::new(&bin_path);
-    cmd.args(&args);
+    #[cfg(target_os = "android")]
+    let mut cmd = {
+        let mut c = Command::new("grun");
+        c.arg(&bin_path);
+        c.args(&args);
+        c
+    };
+    #[cfg(not(target_os = "android"))]
+    let mut cmd = {
+        let mut c = Command::new(&bin_path);
+        c.args(&args);
+        c
+    };
+
+    // Termux sets LD_PRELOAD to libtermux-exec-ld-preload.so (a Bionic
+    // library). Glibc binaries cannot load it, so unset it on Android.
+    #[cfg(target_os = "android")]
+    cmd.env_remove("LD_PRELOAD");
 
     if let Some(prefix_path) = detect_runtime_prefix(&bin_path) {
         if let Some(ca_bundle) = zb_io::find_ca_bundle_from_prefix(&prefix_path) {
