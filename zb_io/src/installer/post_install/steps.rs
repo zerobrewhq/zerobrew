@@ -21,6 +21,7 @@ use tracing::{debug, warn};
 use zb_core::{PathSpec, ProcessMatch, StepAction, Sudo};
 
 use super::ca_bundle::CaBundle;
+use super::font_cache::FontCache;
 use super::paths::{self, expand_glob, resolve};
 use super::template::expand;
 use super::{PostInstallContext, StepError, clang};
@@ -145,6 +146,14 @@ pub(super) fn run_step(
                 .map(|arg| expand(ctx, arg))
                 .collect::<Result<Vec<_>, _>>()?;
             let bundle = CaBundle::detect(ctx, &program, &args, env);
+            // Only a plain run is cached: anything that redirects its input
+            // or output, or tolerates its failure, runs every time.
+            let font_cache = (stdin_path.is_none()
+                && stdout_path.is_none()
+                && chdir.is_none()
+                && !*allow_failure)
+                .then(|| FontCache::detect(ctx, &program, &args, env))
+                .flatten();
             if let Some(bundle) = &bundle
                 && bundle.restore()?
             {
@@ -154,6 +163,10 @@ pub(super) fn run_step(
             {
                 debug!("built the CA bundle in process");
                 bundle.store()?;
+            } else if let Some(font_cache) = &font_cache
+                && font_cache.restore()?
+            {
+                debug!("restored the font cache from the cache");
             } else {
                 run_command(
                     ctx,
@@ -167,6 +180,9 @@ pub(super) fn run_step(
                 )?;
                 if let Some(bundle) = &bundle {
                     bundle.store()?;
+                }
+                if let Some(font_cache) = &font_cache {
+                    font_cache.store()?;
                 }
             }
         }
