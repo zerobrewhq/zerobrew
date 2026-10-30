@@ -11,6 +11,11 @@ pub fn execute(
 
     let report = installer.doctor()?;
 
+    #[cfg(target_os = "android")]
+    for msg in zb_io::android_doctor_messages() {
+        ui.warn(msg).map_err(ui_error)?;
+    }
+
     if report.is_healthy() {
         ui.println(format!("    {} No issues found", style("✓").green()))
             .map_err(ui_error)?;

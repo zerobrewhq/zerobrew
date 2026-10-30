@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use rayon::prelude::*;
 use zb_core::{Error, formula_token};
 
+#[cfg(target_os = "android")]
+use zb_core::platform::termux;
+
 use crate::cellar::linkage;
 use crate::storage::db::StoreRef;
 
@@ -551,5 +554,56 @@ mod tests {
         assert_eq!(report.stale_store_refs[0].store_key, KEY);
         assert!(report.stale_store_refs[0].missing_store_entry());
         assert!(!report.is_healthy());
+    }
+}
+
+#[cfg(target_os = "android")]
+pub fn android_doctor_messages() -> Vec<String> {
+    let mut messages = Vec::new();
+
+    let Some(prefix) = termux::termux_prefix() else {
+        messages.push(
+            "Termux PREFIX is not set; Linux bottles need the Termux glibc package".to_string(),
+        );
+        return messages;
+    };
+
+    match termux::resolve_glibc_dynamic_linker(&prefix) {
+        Some(ld) => {
+            messages.push(format!("Termux glibc dynamic linker: {}", ld.display()));
+        }
+        None => {
+            messages.push(format!(
+                "Termux glibc dynamic linker not found under {}/glibc/lib (enable the glibc apt repo and run: pkg install glibc)",
+                prefix.display()
+            ));
+        }
+    }
+
+    if let Ok(preload) = std::env::var("LD_PRELOAD")
+        && !preload.is_empty()
+    {
+        messages.push(format!(
+            "Warning: LD_PRELOAD is set ({}); this can break glibc bottles on Termux",
+            preload
+        ));
+    }
+
+    messages
+}
+
+#[cfg(test)]
+#[cfg(target_os = "android")]
+mod android_doctor_tests {
+    use super::android_doctor_messages;
+
+    #[test]
+    fn reports_missing_prefix() {
+        unsafe {
+            std::env::remove_var("PREFIX");
+            std::env::remove_var("ZEROBREW_GLIBC_LD");
+        }
+        let msgs = android_doctor_messages();
+        assert!(msgs.iter().any(|m| m.contains("PREFIX is not set")));
     }
 }
