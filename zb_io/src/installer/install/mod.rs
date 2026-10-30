@@ -42,9 +42,19 @@ pub(crate) fn acquire_install_lock(locks_dir: &Path) -> Result<File, Error> {
     let lock_path = locks_dir.join("install.lock");
     let lock_file =
         File::create(&lock_path).map_err(Error::store("failed to create install lock"))?;
-    lock_file
-        .lock()
-        .map_err(Error::store("failed to acquire install lock"))?;
+    // Some filesystems (e.g. Termux's emulated storage) do not support flock.
+    // Fall back to proceeding without the lock rather than failing the install.
+    if let Err(e) = lock_file.lock() {
+        #[cfg(target_os = "android")]
+        {
+            tracing::warn!(error = %e, "install lock not supported on this filesystem; proceeding unlocked");
+            return Ok(lock_file);
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            return Err(Error::store("failed to acquire install lock")(e));
+        }
+    }
     Ok(lock_file)
 }
 
