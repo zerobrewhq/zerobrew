@@ -64,7 +64,7 @@ pub fn default_homebrew_prefix() -> &'static str {
 
 const MACOS_CODENAMES_NEWEST_FIRST: &[&str] = &["tahoe", "sequoia", "sonoma", "ventura"];
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 fn preferred_linux_bottle_tags_for_arch(arch: &str) -> &'static [&'static str] {
     match arch {
         "aarch64" => &["arm64_linux", "aarch64_linux"],
@@ -73,17 +73,17 @@ fn preferred_linux_bottle_tags_for_arch(arch: &str) -> &'static [&'static str] {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn preferred_linux_bottle_tags() -> &'static [&'static str] {
     preferred_linux_bottle_tags_for_arch(std::env::consts::ARCH)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 fn is_compatible_linux_bottle_tag_for_arch(tag: &str, arch: &str) -> bool {
     preferred_linux_bottle_tags_for_arch(arch).contains(&tag)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn is_compatible_linux_bottle_tag(tag: &str) -> bool {
     is_compatible_linux_bottle_tag_for_arch(tag, std::env::consts::ARCH)
 }
@@ -165,7 +165,7 @@ fn select_bottle_with_version(
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         for &preferred_tag in preferred_linux_bottle_tags() {
             if let Some(file) = formula.bottle.stable.files.get(preferred_tag) {
@@ -203,7 +203,7 @@ fn select_bottle_with_version(
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     for (tag, file) in &formula.bottle.stable.files {
         if is_compatible_linux_bottle_tag(tag) {
             return Ok(SelectedBottle::from_file(tag.clone(), file));
