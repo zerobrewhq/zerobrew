@@ -52,9 +52,9 @@ build: fmt-check lint
 [doc('Build the zb binary')]
 [group('build')]
 build-android:
-    CC_aarch64_linux_android=./clang.shim \
-    CXX_aarch64_linux_android=./clang.shim \
-    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=./clang.shim \
+    CC_aarch64_linux_android={{justfile_directory()}}/clang.shim \
+    CXX_aarch64_linux_android={{justfile_directory()}}/clang.shim \
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER={{justfile_directory()}}/clang.shim \
     PKG_CONFIG_ALLOW_CROSS=1 \
     PKG_CONFIG_PATH=$TERMUX__PREFIX/lib/pkgconfig \
     cargo build --features=android-support --bin zb --bin zbx --bin zb-brew
@@ -232,9 +232,9 @@ test:
 [doc('Run all tests for Android (enables android-support feature)')]
 [group('test')]
 test-android: build-android
-    CC_aarch64_linux_android=./clang.shim \
-    CXX_aarch64_linux_android=./clang.shim \
-    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=./clang.shim \
+    CC_aarch64_linux_android={{justfile_directory()}}/clang.shim \
+    CXX_aarch64_linux_android={{justfile_directory()}}/clang.shim \
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER={{justfile_directory()}}/clang.shim \
     PKG_CONFIG_ALLOW_CROSS=1 \
     PKG_CONFIG_PATH=$TERMUX__PREFIX/lib/pkgconfig \
     cargo test --workspace --features=android-support -- --include-ignored
