@@ -1,5 +1,7 @@
 use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use zb_core::{ConflictedLink, Error};
@@ -567,6 +569,30 @@ impl Linker {
                         }],
                     });
                 }
+                #[cfg(target_os = "android")]
+                if top == "bin"
+                    && src_path.is_file()
+                    && src_path
+                        .metadata()
+                        .map(|m| m.permissions().mode() & 0o111 != 0)
+                        .unwrap_or(false)
+                {
+                    let wrapper = format!(
+                        "#!/data/data/com.termux/files/usr/bin/bash\nexec grun {} \"$@\"\n",
+                        src_path.display()
+                    );
+                    fs::write(&dst_path, wrapper)
+                        .map_err(Error::store("failed to create wrapper"))?;
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&dst_path, fs::Permissions::from_mode(0o755))
+                        .map_err(Error::store("failed to chmod wrapper"))?;
+                    linked.push(LinkedFile {
+                        link_path: dst_path,
+                        target_path: src_path,
+                    });
+                    continue;
+                }
+
                 #[cfg(unix)]
                 std::os::unix::fs::symlink(&src_path, &dst_path)
                     .map_err(Error::store("failed to create symlink"))?;
@@ -623,6 +649,29 @@ impl Linker {
                         owned_by: None,
                     }],
                 });
+            }
+
+            #[cfg(target_os = "android")]
+            if top == "bin"
+                && src_path.is_file()
+                && src_path
+                    .metadata()
+                    .map(|m| m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            {
+                let wrapper = format!(
+                    "#!/data/data/com.termux/files/usr/bin/bash\nexec grun {} \"$@\"\n",
+                    src_path.display()
+                );
+                fs::write(&dst_path, wrapper).map_err(Error::store("failed to create wrapper"))?;
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&dst_path, fs::Permissions::from_mode(0o755))
+                    .map_err(Error::store("failed to chmod wrapper"))?;
+                linked.push(LinkedFile {
+                    link_path: dst_path,
+                    target_path: src_path,
+                });
+                continue;
             }
 
             #[cfg(unix)]
