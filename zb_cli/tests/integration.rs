@@ -301,6 +301,17 @@ fn test_gc_removes_unused_store_entries() {
 }
 
 #[test]
+#[ignore = "integration test"]
+fn test_install_build_from_source() {
+    let t = TestEnv::new();
+    assert_success(
+        &t.zb(&["install", "--build-from-source", "adzimzf/tpot/a-test"]),
+        "zb install --build-from-source adzimzf/tpot/a-test",
+    );
+    assert_success(&t.run_binary("a-test", &["--version"]), "a-test --version");
+}
+
+#[test]
 fn only_explicit_init_modifies_shell_configuration() {
     for (shell, config_name) in [
         ("/usr/bin/fish", ".config/fish/conf.d/zerobrew.fish"),

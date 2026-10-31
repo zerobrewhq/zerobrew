@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 pub fn resolve_closure(
     roots: &[String],
     formulas: &BTreeMap<String, Formula>,
+    is_build_from_source: impl Fn(&Formula) -> bool,
 ) -> Result<Vec<String>, Error> {
     let name_to_idx: HashMap<&str, usize> = formulas
         .keys()
@@ -13,7 +14,7 @@ pub fn resolve_closure(
     let idx_to_name: Vec<&str> = formulas.keys().map(|k| k.as_str()).collect();
     let n = idx_to_name.len();
 
-    let closure = compute_closure(roots, formulas, &name_to_idx)?;
+    let closure = compute_closure(roots, formulas, &name_to_idx, &is_build_from_source)?;
 
     let mut indegree = vec![0u32; n];
     let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -21,7 +22,7 @@ pub fn resolve_closure(
     for &idx in &closure {
         let formula = &formulas[idx_to_name[idx]];
         let mut dep_indices: Vec<usize> = formula
-            .runtime_dependencies()
+            .install_dependencies(is_build_from_source(formula))
             .iter()
             .filter_map(|dep| {
                 let &di = name_to_idx.get(dep.as_str())?;
@@ -72,6 +73,7 @@ fn compute_closure(
     roots: &[String],
     formulas: &BTreeMap<String, Formula>,
     name_to_idx: &HashMap<&str, usize>,
+    is_build_from_source: impl Fn(&Formula) -> bool,
 ) -> Result<BTreeSet<usize>, Error> {
     let mut closure = BTreeSet::new();
     let mut stack: Vec<usize> = Vec::with_capacity(roots.len());
@@ -91,7 +93,7 @@ fn compute_closure(
         }
 
         let formula = &formulas[idx_to_name[idx]];
-        for dep in formula.runtime_dependencies() {
+        for dep in formula.install_dependencies(is_build_from_source(formula)) {
             if let Some(&di) = name_to_idx.get(dep.as_str())
                 && !closure.contains(&di)
             {
@@ -153,7 +155,7 @@ mod tests {
         formulas.insert("baz".to_string(), formula("baz", &["qux"]));
         formulas.insert("qux".to_string(), formula("qux", &[]));
 
-        let order = resolve_closure(&["foo".to_string()], &formulas).unwrap();
+        let order = resolve_closure(&["foo".to_string()], &formulas, |_| false).unwrap();
         assert_eq!(order, vec!["qux", "bar", "baz", "foo"]);
     }
 
@@ -164,7 +166,8 @@ mod tests {
         formulas.insert("b".to_string(), formula("b", &["shared"]));
         formulas.insert("shared".to_string(), formula("shared", &[]));
 
-        let order = resolve_closure(&["a".to_string(), "b".to_string()], &formulas).unwrap();
+        let order =
+            resolve_closure(&["a".to_string(), "b".to_string()], &formulas, |_| false).unwrap();
         // shared should come first, then a and b in stable order
         assert_eq!(order, vec!["shared", "a", "b"]);
     }
@@ -176,7 +179,7 @@ mod tests {
         formulas.insert("beta".to_string(), formula("beta", &["gamma"]));
         formulas.insert("gamma".to_string(), formula("gamma", &["alpha"]));
 
-        let err = resolve_closure(&["alpha".to_string()], &formulas).unwrap_err();
+        let err = resolve_closure(&["alpha".to_string()], &formulas, |_| false).unwrap_err();
         assert!(matches!(err, Error::DependencyCycle { .. }));
     }
 
@@ -189,7 +192,7 @@ mod tests {
         formulas.insert("gettext".to_string(), formula("gettext", &[]));
         // libiconv is intentionally missing (filtered out for Linux)
 
-        let order = resolve_closure(&["git".to_string()], &formulas).unwrap();
+        let order = resolve_closure(&["git".to_string()], &formulas, |_| false).unwrap();
         // Should successfully resolve with just git and gettext
         assert_eq!(order, vec!["gettext", "git"]);
     }
@@ -207,7 +210,7 @@ mod tests {
         formulas.insert("openssl@3".to_string(), formula("openssl@3", &[]));
         formulas.insert("expat".to_string(), formula("expat", &[]));
 
-        let order = resolve_closure(&["python@3.14".to_string()], &formulas).unwrap();
+        let order = resolve_closure(&["python@3.14".to_string()], &formulas, |_| false).unwrap();
         assert_eq!(order, vec!["expat", "openssl@3", "python@3.14"]);
     }
 }

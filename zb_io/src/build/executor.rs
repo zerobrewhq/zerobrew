@@ -505,6 +505,59 @@ end
     }
 
     #[tokio::test]
+    async fn run_build_supports_class_level_build_options_and_cd() {
+        let Some(ruby) = find_ruby().await.ok() else {
+            return;
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_root = tmp.path().join("source");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::write(source_root.join("main.go"), "package main\n").unwrap();
+
+        // Mirrors https://github.com/xo/homebrew-xo/blob/master/Formula/usql.rb
+        let formula = r#"
+$tags = %w(most)
+
+class Foo < Formula
+  option "with-odbc", "Build with ODBC support"
+
+  if build.with? "odbc" then
+    $tags << "odbc"
+    depends_on "unixodbc"
+  end
+
+  $tags << "no-extra" if build.without? "extra"
+
+  def install
+    (buildpath/"src/example.com/foo").install buildpath.children
+    cd "src/example.com/foo" do
+      File.write(prefix + "tags", $tags.join(" "))
+      raise "source not installed" unless File.exist?("main.go")
+      File.write(prefix + "cwd", Dir.pwd)
+    end
+    File.write(prefix + "after", Dir.pwd)
+  end
+end
+"#;
+
+        let prefix = tmp.path().join("prefix");
+        run_shim_formula(&ruby, &source_root, &prefix, formula)
+            .await
+            .unwrap();
+
+        let keg = prefix.join("Cellar").join("foo").join("1.0.0");
+        assert_eq!(
+            std::fs::read_to_string(keg.join("tags")).unwrap(),
+            "most no-extra"
+        );
+        let cwd = std::fs::read_to_string(keg.join("cwd")).unwrap();
+        assert!(cwd.ends_with("src/example.com/foo"), "cwd: {cwd}");
+        let after = std::fs::read_to_string(keg.join("after")).unwrap();
+        assert!(!after.ends_with("src/example.com/foo"), "after: {after}");
+    }
+
+    #[tokio::test]
     async fn run_build_with_env_applies_symbol_key_and_pathname_then_restores() {
         let Some(ruby) = find_ruby().await.ok() else {
             return;

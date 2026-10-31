@@ -17,8 +17,11 @@ impl Installer {
         names: &[String],
         build_from_source: bool,
     ) -> Result<InstallPlan, Error> {
-        let formulas = self.fetch_all_formulas(names).await?;
-        let ordered = zb_core::resolve_closure(names, &formulas)?;
+        let formulas = self.fetch_all_formulas(names, build_from_source).await?;
+        let forced = forced_source_names(names, &formulas, build_from_source);
+        let ordered = zb_core::resolve_closure(names, &formulas, |f| {
+            self.builds_from_source(f, forced.contains(&f.name))
+        })?;
 
         let roots = root_install_names(names, &formulas);
         let mut items = Vec::with_capacity(ordered.len());
@@ -32,7 +35,8 @@ impl Installer {
             if !roots.contains(&install_name) && self.has_installed_keg(&install_name) {
                 continue;
             }
-            items.push(self.plan_item(install_name, formula, build_from_source)?);
+            let force = forced.contains(&formula.name);
+            items.push(self.plan_item(install_name, formula, force)?);
         }
 
         Ok(InstallPlan { items })
@@ -43,11 +47,16 @@ impl Installer {
         names: &[String],
         build_from_source: bool,
     ) -> (InstallPlan, Vec<PlanFailure>) {
-        let (formulas, fetch_failures) = self.fetch_all_formulas_best_effort(names).await;
+        let (formulas, fetch_failures) = self
+            .fetch_all_formulas_best_effort(names, build_from_source)
+            .await;
         let mut items = Vec::new();
         let mut failures = Vec::new();
         let mut valid_roots = Vec::new();
         let mut seen_roots = HashSet::new();
+        let forced = forced_source_names(names, &formulas, build_from_source);
+        let is_build_from_source =
+            |f: &Formula| self.builds_from_source(f, forced.contains(&f.name));
 
         for name in names {
             if !seen_roots.insert(name.clone()) {
@@ -70,7 +79,9 @@ impl Installer {
                 continue;
             }
 
-            if let Some(failure) = root_dependency_failure(name, &formulas, &fetch_failures) {
+            if let Some(failure) =
+                root_dependency_failure(name, &formulas, &fetch_failures, is_build_from_source)
+            {
                 failures.push(failure);
                 continue;
             }
@@ -79,7 +90,7 @@ impl Installer {
         }
 
         if !valid_roots.is_empty() {
-            match zb_core::resolve_closure(&valid_roots, &formulas) {
+            match zb_core::resolve_closure(&valid_roots, &formulas, is_build_from_source) {
                 Ok(ordered) => {
                     let roots = root_install_names(&valid_roots, &formulas);
                     let mut planned = HashSet::new();
@@ -92,7 +103,8 @@ impl Installer {
                         if !roots.contains(&install_name) && self.has_installed_keg(&install_name) {
                             continue;
                         }
-                        match self.plan_item(install_name.clone(), formula, build_from_source) {
+                        let force = forced.contains(&formula.name);
+                        match self.plan_item(install_name.clone(), formula, force) {
                             Ok(item) => items.push(item),
                             Err(error) => failures.push(PlanFailure {
                                 name: install_name,
@@ -192,6 +204,7 @@ impl Installer {
     async fn fetch_all_formulas_best_effort(
         &self,
         names: &[String],
+        build_from_source: bool,
     ) -> (BTreeMap<String, Formula>, HashMap<String, Error>) {
         let mut formulas = BTreeMap::new();
         let mut failures = HashMap::new();
@@ -243,7 +256,9 @@ impl Installer {
                     continue;
                 }
 
-                for dep in formula.runtime_dependencies() {
+                let force = build_from_source && names.contains(&fetch_name);
+                let is_build_source = self.builds_from_source(&formula, force);
+                for dep in formula.install_dependencies(is_build_source) {
                     if !fetched.contains(&dep)
                         && !to_fetch.contains(&dep)
                         && !failures.contains_key(&dep)
@@ -262,6 +277,7 @@ impl Installer {
     async fn fetch_all_formulas(
         &self,
         names: &[String],
+        build_from_source: bool,
     ) -> Result<BTreeMap<String, Formula>, Error> {
         use std::collections::HashSet;
 
@@ -304,7 +320,9 @@ impl Installer {
                     continue;
                 }
 
-                for dep in formula.runtime_dependencies() {
+                let force = build_from_source && names.contains(&batch[i]);
+                let is_build_from_source = self.builds_from_source(&formula, force);
+                for dep in formula.install_dependencies(is_build_from_source) {
                     if !fetched.contains(&dep) && !to_fetch.contains(&dep) {
                         to_fetch.push(dep);
                     }
@@ -315,6 +333,15 @@ impl Installer {
         }
 
         Ok(formulas)
+    }
+
+    fn builds_from_source(&self, formula: &Formula, build_from_source: bool) -> bool {
+        let can_build = BuildPlan::from_formula(formula, &self.prefix).is_some();
+        if build_from_source {
+            can_build
+        } else {
+            self.select_pourable_bottle(formula).is_err() && can_build
+        }
     }
 }
 
@@ -328,6 +355,22 @@ fn install_name_for(requested: &str, formula: &Formula) -> String {
     } else {
         formula.name.clone()
     }
+}
+
+/// `--build-from-source` applies only to the requested formulas.
+/// dependencies still prefer bottles and fall back to source when none pours.
+fn forced_source_names(
+    names: &[String],
+    formulas: &BTreeMap<String, Formula>,
+    build_from_source: bool,
+) -> HashSet<String> {
+    if !build_from_source {
+        return HashSet::new();
+    }
+    names
+        .iter()
+        .filter_map(|name| formulas.get(name).map(|f| f.name.clone()))
+        .collect()
 }
 
 /// The install names of the packages the caller asked for, as opposed to the
@@ -347,6 +390,7 @@ fn root_dependency_failure(
     root: &str,
     formulas: &BTreeMap<String, Formula>,
     fetch_failures: &HashMap<String, Error>,
+    is_build_from_source: impl Fn(&Formula) -> bool,
 ) -> Option<PlanFailure> {
     let mut seen = HashSet::new();
     let mut stack = vec![root.to_string()];
@@ -360,7 +404,7 @@ fn root_dependency_failure(
             continue;
         };
 
-        for dep in formula.runtime_dependencies() {
+        for dep in formula.install_dependencies(is_build_from_source(formula)) {
             if let Some(error) = fetch_failures.get(&dep) {
                 return Some(PlanFailure {
                     name: root.to_string(),
@@ -393,7 +437,7 @@ mod tests {
     use crate::storage::blob::BlobCache;
     use crate::storage::db::Database;
     use crate::storage::store::Store;
-    use crate::{Installer, Linker};
+    use crate::{InstallPlan, Installer, Linker};
 
     #[tokio::test]
     async fn plans_tapped_formula_with_core_dependency() {
@@ -514,6 +558,13 @@ end
             .respond_with(ResponseTemplate::new(200).set_body_string(formula_json))
             .mount(&mock_server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/formula/pkgconf.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(bottled_formula("pkgconf", &[])),
+            )
+            .mount(&mock_server)
+            .await;
 
         let root = tmp.path().join("zerobrew");
         let prefix = tmp.path().join("homebrew");
@@ -540,10 +591,10 @@ end
 
         let plan = installer.plan(&["nobottle".to_string()]).await.unwrap();
 
-        assert_eq!(plan.items.len(), 1);
-        assert_eq!(plan.items[0].formula.name, "nobottle");
+        assert_eq!(plan.items.len(), 2);
+        assert_eq!(plan.items[0].formula.name, "pkgconf");
         assert!(matches!(
-            plan.items[0].method,
+            plan.items[1].method,
             zb_core::InstallMethod::Source(_)
         ));
 
@@ -940,5 +991,106 @@ end
             failures[0].error,
             zb_core::Error::MissingFormula { .. }
         ));
+    }
+
+    fn buildable_formula(name: &str, cellar: Option<&str>) -> String {
+        let cellar = cellar
+            .map(|c| format!(r##", "cellar":"{c}""##))
+            .unwrap_or_default();
+        format!(
+            r#"{{
+                "name": "{name}",
+                "versions": {{ "stable": "1.0.0" }},
+                "dependencies": [],
+                "build_dependencies": ["pkgconf"],
+                "urls": {{ "stable": {{ "url": "https://example.com/{name}-1.0.0.tar.gz", "checksum": "abc123" }} }},
+                "ruby_source_path": "Formula/{first}/{name}.rb",
+                "bottle": {{ "stable": {{ "files": {{
+                    "{tag}": {{ "url": "https://example.com/{name}.tar.gz", "sha256": "aabbccdd"{cellar} }}
+                }} }} }}
+            }}"#,
+            first = &name[..1],
+            tag = get_test_bottle_tag(),
+        )
+    }
+
+    fn assert_source_with_build_dep(plan: &InstallPlan, name: &str) {
+        let names: Vec<_> = plan.items.iter().map(|i| i.formula.name.as_str()).collect();
+        assert!(
+            names.contains(&"pkgconf"),
+            "build dep missing from plan: {names:?}"
+        );
+        let item = plan.items.iter().find(|i| i.formula.name == name).unwrap();
+        assert!(matches!(item.method, zb_core::InstallMethod::Source(_)));
+    }
+
+    // bottle exists,but user forces source build.
+    #[tokio::test]
+    async fn build_from_source_flag_plans_build_dependencies() {
+        let mock_server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+        let installer = installer_serving(
+            &mock_server,
+            &tmp,
+            &[
+                ("tool", buildable_formula("tool", None)),
+                ("pkgconf", bottled_formula("pkgconf", &[])),
+            ],
+        )
+        .await;
+
+        let plan = installer
+            .plan_with_options(&["tool".to_string()], true)
+            .await
+            .unwrap();
+        assert_source_with_build_dep(&plan, "tool");
+    }
+
+    // The flag must not force dependencies (or their build deps) from source.
+    #[tokio::test]
+    async fn build_from_source_flag_only_applies_to_roots() {
+        let mock_server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+        let mut app: serde_json::Value =
+            serde_json::from_str(&buildable_formula("app", None)).unwrap();
+        app["dependencies"] = serde_json::json!(["lib"]);
+        let installer = installer_serving(
+            &mock_server,
+            &tmp,
+            &[
+                ("app", app.to_string()),
+                ("lib", buildable_formula("lib", None)),
+                ("pkgconf", bottled_formula("pkgconf", &[])),
+            ],
+        )
+        .await;
+
+        let plan = installer
+            .plan_with_options(&["app".to_string()], true)
+            .await
+            .unwrap();
+        assert_source_with_build_dep(&plan, "app");
+        let lib = plan.items.iter().find(|i| i.formula.name == "lib").unwrap();
+        assert!(matches!(lib.method, zb_core::InstallMethod::Bottle(_)));
+    }
+
+    // select_pourable_bottle rejects the bottle in macos.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn unpourable_bottle_plans_build_dependencies() {
+        let mock_server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+        let installer = installer_serving(
+            &mock_server,
+            &tmp,
+            &[
+                ("tool", buildable_formula("tool", Some("/usr/local/Cellar"))),
+                ("pkgconf", bottled_formula("pkgconf", &[])),
+            ],
+        )
+        .await;
+
+        let plan = installer.plan(&["tool".to_string()]).await.unwrap();
+        assert_source_with_build_dep(&plan, "tool");
     }
 }
