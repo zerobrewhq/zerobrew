@@ -299,7 +299,7 @@ and their ELF interpreter is patched to Termux's glibc loader.
 Requirements:
 
 - Enable Termux's glibc repository and install glibc: `pkg install glibc`
-- zerobrew detects the loader at `$PREFIX/glibc/lib/ld-linux-*.so.*`
+- zerobrew detects the loader at `$TERMUX__PREFIX/glibc/lib/ld-linux-*.so.*`
 - Override detection with `ZEROBREW_GLIBC_LD=/path/to/ld-linux-*.so.*`
 
 Limitations:

@@ -563,7 +563,7 @@ pub fn android_doctor_messages() -> Vec<String> {
 
     let Some(prefix) = termux::termux_prefix() else {
         messages.push(
-            "Termux PREFIX is not set; Linux bottles need the Termux glibc package".to_string(),
+            "TERMUX__PREFIX is not set; Linux bottles need the Termux glibc package".to_string(),
         );
         return messages;
     };
@@ -600,10 +600,10 @@ mod android_doctor_tests {
     #[test]
     fn reports_missing_prefix() {
         unsafe {
-            std::env::remove_var("PREFIX");
+            std::env::remove_var("TERMUX__PREFIX");
             std::env::remove_var("ZEROBREW_GLIBC_LD");
         }
         let msgs = android_doctor_messages();
-        assert!(msgs.iter().any(|m| m.contains("PREFIX is not set")));
+        assert!(msgs.iter().any(|m| m.contains("TERMUX__PREFIX is not set")));
     }
 }

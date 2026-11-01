@@ -1,7 +1,9 @@
 use std::fs;
 use std::io;
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
 use std::path::{Component, Path, PathBuf};
 
 use zb_core::{ConflictedLink, Error};
@@ -197,15 +199,67 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     out
 }
 
+/// The shell used by the Android wrapper scripts. Prefer the Termux prefix
+/// the process was started with instead of hard-coding its path.
+#[cfg(target_os = "android")]
+fn android_shell() -> String {
+    let prefix = std::env::var("TERMUX__PREFIX")
+        .unwrap_or_else(|_| "/data/data/com.termux/files/usr".to_string());
+    format!("{prefix}/bin/bash")
+}
+
+/// On Android, executables in `bin/` are wrapper scripts that run the real
+/// keg binary through `grun` instead of symlinks. Return the keg path such a
+/// wrapper points at, if `dst` is one.
+#[cfg(target_os = "android")]
+fn wrapper_target(dst: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(dst).ok()?;
+    let mut buf = [0u8; 4096];
+    let read = file.read(&mut buf).ok()?;
+    let text = std::str::from_utf8(&buf[..read]).ok()?;
+    if !text.starts_with("#!") {
+        return None;
+    }
+    let target = text
+        .lines()
+        .find_map(|line| line.strip_prefix("exec grun "))?
+        .strip_suffix(" \"$@\"")?;
+    Some(PathBuf::from(target))
+}
+
+#[cfg(not(target_os = "android"))]
+fn wrapper_target(_dst: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// Write an Android `grun` wrapper at `dst` for the keg binary `src`.
+#[cfg(target_os = "android")]
+fn write_wrapper(src: &Path, dst: &Path) -> io::Result<()> {
+    let wrapper = format!(
+        "#!{}\nexec grun {} \"$@\"\n",
+        android_shell(),
+        src.display()
+    );
+    fs::write(dst, wrapper)?;
+    fs::set_permissions(dst, fs::Permissions::from_mode(0o755))
+}
+
 /// Read the symlink at `dst` and resolve a relative target against its parent
-/// directory. Returns `None` when `dst` is not a symlink.
+/// directory. Returns `None` when `dst` is not a link.
+///
+/// Android `bin/` wrappers are treated as links too: they stand in for the
+/// symlink that would otherwise point at the keg binary.
 fn resolve_link_target(dst: &Path) -> Option<PathBuf> {
-    let target = fs::read_link(dst).ok()?;
-    Some(if target.is_relative() {
-        dst.parent().unwrap_or(Path::new("")).join(&target)
-    } else {
-        target
-    })
+    if let Ok(target) = fs::read_link(dst) {
+        return Some(if target.is_relative() {
+            dst.parent().unwrap_or(Path::new("")).join(&target)
+        } else {
+            target
+        });
+    }
+    wrapper_target(dst)
 }
 
 fn keg_name_from_symlink(dst: &Path) -> Option<String> {
@@ -376,12 +430,7 @@ impl Linker {
             }
 
             if dst_path.symlink_metadata().is_ok() {
-                if let Ok(target) = fs::read_link(&dst_path) {
-                    let resolved = if target.is_relative() {
-                        dst_path.parent().unwrap_or(Path::new("")).join(&target)
-                    } else {
-                        target
-                    };
+                if let Some(resolved) = resolve_link_target(&dst_path) {
                     if fs::canonicalize(&resolved).ok() == fs::canonicalize(&src_path).ok() {
                         continue;
                     }
@@ -577,15 +626,8 @@ impl Linker {
                         .map(|m| m.permissions().mode() & 0o111 != 0)
                         .unwrap_or(false)
                 {
-                    let wrapper = format!(
-                        "#!/data/data/com.termux/files/usr/bin/bash\nexec grun {} \"$@\"\n",
-                        src_path.display()
-                    );
-                    fs::write(&dst_path, wrapper)
+                    write_wrapper(&src_path, &dst_path)
                         .map_err(Error::store("failed to create wrapper"))?;
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::set_permissions(&dst_path, fs::Permissions::from_mode(0o755))
-                        .map_err(Error::store("failed to chmod wrapper"))?;
                     linked.push(LinkedFile {
                         link_path: dst_path,
                         target_path: src_path,
@@ -608,12 +650,7 @@ impl Linker {
             }
 
             if dst_path.symlink_metadata().is_ok() {
-                if let Ok(target) = fs::read_link(&dst_path) {
-                    let resolved = if target.is_relative() {
-                        dst_path.parent().unwrap_or(Path::new("")).join(&target)
-                    } else {
-                        target
-                    };
+                if let Some(resolved) = resolve_link_target(&dst_path) {
                     if fs::canonicalize(&resolved).ok() == fs::canonicalize(&src_path).ok() {
                         if resolved.exists() {
                             linked.push(LinkedFile {
@@ -659,14 +696,8 @@ impl Linker {
                     .map(|m| m.permissions().mode() & 0o111 != 0)
                     .unwrap_or(false)
             {
-                let wrapper = format!(
-                    "#!/data/data/com.termux/files/usr/bin/bash\nexec grun {} \"$@\"\n",
-                    src_path.display()
-                );
-                fs::write(&dst_path, wrapper).map_err(Error::store("failed to create wrapper"))?;
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&dst_path, fs::Permissions::from_mode(0o755))
-                    .map_err(Error::store("failed to chmod wrapper"))?;
+                write_wrapper(&src_path, &dst_path)
+                    .map_err(Error::store("failed to create wrapper"))?;
                 linked.push(LinkedFile {
                     link_path: dst_path,
                     target_path: src_path,
@@ -730,16 +761,11 @@ impl Linker {
                 continue;
             }
 
-            if let Ok(target) = fs::read_link(&dst_path) {
-                let resolved = if target.is_relative() {
-                    dst_path.parent().unwrap_or(Path::new("")).join(&target)
-                } else {
-                    target
-                };
-                if fs::canonicalize(&resolved).ok() == fs::canonicalize(&src_path).ok() {
-                    let _ = fs::remove_file(&dst_path);
-                    unlinked.push(dst_path);
-                }
+            if let Some(resolved) = resolve_link_target(&dst_path)
+                && fs::canonicalize(&resolved).ok() == fs::canonicalize(&src_path).ok()
+            {
+                let _ = fs::remove_file(&dst_path);
+                unlinked.push(dst_path);
             }
         }
         Ok(unlinked)
@@ -762,18 +788,13 @@ impl Linker {
                 continue;
             }
 
-            if let Ok(target) = fs::read_link(&dst_path) {
-                let resolved = if target.is_relative() {
-                    dst_path.parent().unwrap_or(Path::new("")).join(&target)
-                } else {
-                    target
-                };
-                if fs::canonicalize(&resolved).ok() == fs::canonicalize(&src_path).ok() {
-                    linked.push(LinkedFile {
-                        link_path: dst_path,
-                        target_path: src_path,
-                    });
-                }
+            if let Some(resolved) = resolve_link_target(&dst_path)
+                && fs::canonicalize(&resolved).ok() == fs::canonicalize(&src_path).ok()
+            {
+                linked.push(LinkedFile {
+                    link_path: dst_path,
+                    target_path: src_path,
+                });
             }
         }
         Ok(linked)
@@ -865,15 +886,10 @@ impl Linker {
         if let Ok(entries) = fs::read_dir(&keg_bin) {
             for entry in entries.flatten() {
                 let dst_path = self.bin_dir.join(entry.file_name());
-                if let Ok(target) = fs::read_link(&dst_path) {
-                    let resolved = if target.is_relative() {
-                        dst_path.parent().unwrap_or(Path::new("")).join(&target)
-                    } else {
-                        target
-                    };
-                    if fs::canonicalize(&resolved).ok() == fs::canonicalize(entry.path()).ok() {
-                        return true;
-                    }
+                if let Some(resolved) = resolve_link_target(&dst_path)
+                    && fs::canonicalize(&resolved).ok() == fs::canonicalize(entry.path()).ok()
+                {
+                    return true;
                 }
             }
         }
@@ -886,6 +902,12 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    /// The target of a prefix entry, whether it is a symlink or an Android
+    /// `grun` wrapper script.
+    fn link_target(path: impl AsRef<Path>) -> PathBuf {
+        resolve_link_target(path.as_ref()).expect("expected a symlink or android wrapper")
+    }
 
     fn setup_keg(tmp: &TempDir, name: &str) -> PathBuf {
         let keg_path = tmp.path().join("cellar").join(name).join("1.0.0");
@@ -904,6 +926,20 @@ mod tests {
         let linker = Linker::new(tmp.path()).unwrap();
         linker.link_keg(&keg).unwrap();
         assert!(tmp.path().join("bin/foo").exists());
+    }
+
+    /// Android links executables as `grun` wrapper scripts instead of
+    /// symlinks, so unlinking has to remove those wrappers too.
+    #[test]
+    fn unlink_removes_linked_executables() {
+        let tmp = TempDir::new().unwrap();
+        let keg = setup_keg(&tmp, "foo");
+        let linker = Linker::new(tmp.path()).unwrap();
+        linker.link_keg(&keg).unwrap();
+        assert!(tmp.path().join("bin/foo").exists());
+
+        linker.unlink_keg(&keg).unwrap();
+        assert!(!tmp.path().join("bin/foo").exists());
     }
 
     /// llvm's keg has `etc/clang -> ../../../../etc/clang`, pointing at the
@@ -1437,7 +1473,7 @@ mod tests {
         let old_keg = setup_keg(&tmp, "foo");
         linker.link_keg(&old_keg).unwrap();
         fs::remove_dir_all(&old_keg).unwrap();
-        assert!(prefix.join("bin/foo").is_symlink());
+        assert!(prefix.join("bin/foo").symlink_metadata().is_ok());
 
         let new_keg = prefix.join("cellar/foo/2.0.0");
         fs::create_dir_all(new_keg.join("bin")).unwrap();
@@ -1446,7 +1482,7 @@ mod tests {
         assert!(linker.check_conflicts(&new_keg).is_ok());
         linker.link_keg(&new_keg).unwrap();
 
-        let target = fs::read_link(prefix.join("bin/foo")).unwrap();
+        let target = link_target(prefix.join("bin/foo"));
         assert!(target.to_string_lossy().contains("2.0.0"));
         assert!(prefix.join("bin/foo").exists(), "link must not be dangling");
     }
@@ -1473,7 +1509,7 @@ mod tests {
         assert!(linker.check_conflicts(&keg).is_ok());
         linker.link_keg(&keg).unwrap();
 
-        let target = fs::read_link(prefix.join("bin/tool")).unwrap();
+        let target = link_target(prefix.join("bin/tool"));
         assert!(target.to_string_lossy().contains("cellar/tool/1.0.0"));
     }
 
@@ -1498,7 +1534,7 @@ mod tests {
             assert_eq!(conflicts[0].owned_by.as_deref(), Some("alpha"));
         }
         assert!(linker.link_keg(&keg2).is_err());
-        let target = fs::read_link(prefix.join("bin/alpha")).unwrap();
+        let target = link_target(prefix.join("bin/alpha"));
         assert!(target.to_string_lossy().contains("alpha/1.0.0"));
     }
 

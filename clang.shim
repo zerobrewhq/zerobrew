@@ -5,7 +5,8 @@
 args=()
 for a in "$@"; do
   if [[ "$a" == "--target=aarch64-linux-android" ]]; then
-    args+=("--target=aarch64-linux-android24")
+    # args+=("--target=aarch64-linux-android24")
+    args+=("--target=aarch64-linux-android${TERMUX_APP__TARGET_SDK}")
   else
     args+=("$a")
   fi

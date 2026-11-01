@@ -1,12 +1,12 @@
 use std::path::{Path, PathBuf};
 
-/// Basenames of glibc dynamic linkers under `$PREFIX/glibc/lib`.
+/// Basenames of glibc dynamic linkers under `$TERMUX__PREFIX/glibc/lib`.
 const LD_LINUX_AARCH64: &str = "ld-linux-aarch64.so.1";
 const LD_LINUX_X86_64: &str = "ld-linux-x86-64.so.2";
 
-/// Termux install root (`$PREFIX`), when running on Android/Termux.
+/// Termux install root (`$TERMUX__PREFIX`), when running on Android/Termux.
 pub fn termux_prefix() -> Option<PathBuf> {
-    std::env::var("PREFIX")
+    std::env::var("TERMUX__PREFIX")
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
@@ -41,7 +41,7 @@ pub fn resolve_glibc_dynamic_linker(termux_prefix: &Path) -> Option<PathBuf> {
 /// Whether Termux's glibc sidecar is present enough to pour Linux bottles.
 pub fn termux_glibc_ready_message() -> Result<PathBuf, String> {
     let prefix = termux_prefix().ok_or_else(|| {
-        "Termux PREFIX is not set; Linux bottles need the Termux glibc package".to_string()
+        "TERMUX__PREFIX is not set; Linux bottles need the Termux glibc package".to_string()
     })?;
     resolve_glibc_dynamic_linker(&prefix).ok_or_else(|| {
         format!(

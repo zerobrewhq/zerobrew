@@ -105,9 +105,9 @@ pub async fn execute(
             cmd.env("SSL_CERT_DIR", &ca_dir);
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "android")]
         {
-            let termux_prefix = std::env::var("PREFIX").ok();
+            let termux_prefix = std::env::var("TERMUX__PREFIX").ok();
             let lib_dirs = run_lib_dirs(&prefix_path, termux_prefix.as_deref());
 
             let lib_path = lib_dirs
@@ -134,12 +134,20 @@ pub async fn execute(
 }
 
 /// Library directories to expose via LD_LIBRARY_PATH when running a bottle.
+#[cfg(not(target_os = "android"))]
+pub fn run_lib_dirs(prefix_path: &Path) -> Vec<PathBuf> {
+    vec![prefix_path.join("lib")]
+}
+
+/// Library directories to expose via LD_LIBRARY_PATH when running a bottle.
+#[cfg(target_os = "android")]
 pub fn run_lib_dirs(prefix_path: &Path, termux_prefix: Option<&str>) -> Vec<PathBuf> {
     let mut dirs = vec![prefix_path.join("lib")];
-    #[cfg(target_os = "android")]
-    if let Some(tp) = termux_prefix {
-        dirs.push(std::path::PathBuf::from(tp).join("glibc/lib"));
+
+    if let Some(prefix) = termux_prefix {
+        dirs.push(std::path::PathBuf::from(prefix).join("glibc/lib"));
     }
+
     dirs
 }
 
@@ -455,8 +463,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "android"))]
     fn run_lib_dirs_includes_prefix_lib() {
-        let dirs = run_lib_dirs(Path::new("/opt/zb/prefix"), None);
+        let dirs = run_lib_dirs(Path::new("/opt/zb/prefix"));
         assert!(dirs.iter().any(|p| p == Path::new("/opt/zb/prefix/lib")));
     }
 

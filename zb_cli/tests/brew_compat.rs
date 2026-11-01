@@ -5,8 +5,25 @@ use std::os::unix::{
     fs::{PermissionsExt, symlink},
     process::ExitStatusExt,
 };
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{PoisonError, RwLock};
+
+/// Locate bash without assuming the FHS layout. Termux (Android) has no
+/// `/bin/bash`, only `$TERMUX__PREFIX/bin/bash`.
+fn bash() -> PathBuf {
+    let candidate = Path::new("/bin/bash");
+    if candidate.exists() {
+        return candidate.to_path_buf();
+    }
+    if let Ok(prefix) = std::env::var("TERMUX__PREFIX") {
+        let candidate = Path::new(&prefix).join("bin/bash");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from("bash")
+}
 
 /// A child forked by another test thread keeps any open write descriptor until
 /// it execs, and executing that file in the meantime fails with ETXTBSY. Writes
@@ -33,17 +50,62 @@ fn entrypoint() -> tempfile::TempDir {
 }
 
 #[test]
+fn probe_signal_status() {
+    let status = fs::read_to_string("/proc/self/status").unwrap();
+    for line in status.lines() {
+        if line.starts_with("SigBlk") || line.starts_with("SigIgn") || line.starts_with("SigCgt") {
+            eprintln!("PROBE {line}");
+        }
+    }
+}
+
+#[test]
+fn probe_sh_signal() {
+    let out = Command::new("/bin/sh")
+        .args(["-c", "kill -TERM $$"])
+        .output()
+        .unwrap();
+    eprintln!(
+        "PROBE_SH status={:?} code={:?} signal={:?}",
+        out.status,
+        out.status.code(),
+        out.status.signal()
+    );
+    let mut vars: Vec<_> = std::env::vars().collect();
+    vars.sort();
+    for (k, v) in vars {
+        if [
+            "PATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "SHELL",
+            "PPID",
+            "TMPDIR",
+            "RUST_TEST_THREADS",
+        ]
+        .contains(&k.as_str())
+        {
+            eprintln!("PROBE_ENV {k}={v}");
+        }
+    }
+}
+
+#[test]
 fn forwards_to_adjacent_zb_and_preserves_arguments_status_and_signal() {
     let dir = entrypoint();
     let zb = dir.path().join("zb");
     write_executables(|| {
-        fs::write(&zb, "#!/bin/sh\nprintf '%s\\n' \"$@\"\nif [ \"${TEST_ZB_SIGNAL:-}\" = yes ]; then kill -TERM $$; fi\nexit \"${TEST_ZB_EXIT:-0}\"\n").unwrap()
+        fs::write(&zb, "#!/bin/sh\nenv | sort > \"$ZBTEST_ENV_DUMP\"\nfor arg in \"$@\"; do echo \"$arg\"; done\nif [ \"${TEST_ZB_SIGNAL:-}\" = yes ]; then kill -TERM $$; fi\nexit \"${TEST_ZB_EXIT:-0}\"\n").unwrap()
     });
     fs::set_permissions(&zb, fs::Permissions::from_mode(0o755)).unwrap();
     let brew = dir.path().join("brew");
     let output = run(Command::new(&brew)
         .env("PATH", "")
         .env("TEST_ZB_EXIT", "17")
+        .env(
+            "ZBTEST_ENV_DUMP",
+            std::env::temp_dir().join("zb_env_dump.txt"),
+        )
         .args(["install", "a b", "c", "--no-link"]));
     assert_eq!(output.status.code(), Some(17));
     assert_eq!(output.stdout, b"install\na b\nc\n--no-link\n");
@@ -54,6 +116,14 @@ fn forwards_to_adjacent_zb_and_preserves_arguments_status_and_signal() {
     let output = run(Command::new(&brew)
         .env("TEST_ZB_SIGNAL", "yes")
         .args(["list"]));
+    eprintln!(
+        "DEBUG signal status={:?} code={:?} signal={:?} stdout={:?} stderr={:?}",
+        output.status,
+        output.status.code(),
+        output.status.signal(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(output.status.signal(), Some(15));
 }
 
@@ -135,7 +205,7 @@ fn installer_keeps_brew_opt_in_for_explicit_and_release_binaries() {
             let zb = sources.join("zb");
             let curl = tools.join("curl");
             write_executables(|| {
-                fs::write(&zb, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo zerobrew-test; exit 0; fi\nprintf '%s\\n' \"$*\" >> \"$TEST_INSTALL_LOG\"\n").unwrap();
+                fs::write(&zb, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo zerobrew-test; exit 0; fi\necho \"$*\" >> \"$TEST_INSTALL_LOG\"\n").unwrap();
                 fs::set_permissions(&zb, fs::Permissions::from_mode(0o755)).unwrap();
                 for name in ["zbx", "zb-brew"] {
                     fs::copy(&zb, sources.join(name)).unwrap();
@@ -143,7 +213,7 @@ fn installer_keeps_brew_opt_in_for_explicit_and_release_binaries() {
                 fs::write(&curl, "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = -o ]; then destination=$2; shift; fi\n  shift\ndone\n/bin/cp \"$TEST_INSTALL_SOURCES/${destination##*/}\" \"$destination\"\n").unwrap();
                 fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
             });
-            let mut command = Command::new("/bin/bash");
+            let mut command = Command::new(bash());
             command
                 .arg(&installer)
                 .arg("--no-modify-path")
