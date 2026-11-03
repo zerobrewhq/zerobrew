@@ -3,3 +3,8 @@
 test_zb/
 /site/node_modules
 /site/_site
+
+
+# IDE
+.zed
+.openidea
