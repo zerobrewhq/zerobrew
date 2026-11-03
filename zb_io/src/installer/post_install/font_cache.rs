@@ -72,10 +72,7 @@ impl FontCache {
         if Path::new(program).file_name() != Some(OsStr::new("fc-cache")) {
             return None;
         }
-        if FONTCONFIG_ENV
-            .iter()
-            .any(|name| std::env::var_os(name).is_some())
-        {
+        if fontconfig_env_overridden() {
             return None;
         }
 
@@ -122,6 +119,17 @@ impl FontCache {
         if !self.cached.is_dir() {
             return Ok(false);
         }
+        // `--really-force` starts from an empty cache directory; match it.
+        match fs::remove_dir_all(&self.destination) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(StepError::Failed(format!(
+                    "clearing {}: {err}",
+                    self.destination.display()
+                )));
+            }
+        }
         copy_files(&self.cached, &self.destination)?;
         Ok(true)
     }
@@ -144,6 +152,7 @@ impl FontCache {
             Ok(()) => {
                 // The directory is in place now; keep `TempDir` from removing it.
                 let _ = staging.keep();
+                self.prune_siblings(parent);
                 Ok(())
             }
             // Another install stored the same key first.
@@ -154,6 +163,35 @@ impl FontCache {
             ))),
         }
     }
+
+    /// Drop the entries stored under older keys. A key only changes when
+    /// fontconfig or its fonts do, so those entries are never hit again.
+    /// Other stores' staging directories are left alone.
+    fn prune_siblings(&self, parent: &Path) {
+        let Ok(entries) = fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let staging = entry.file_name().to_string_lossy().starts_with(".staging-");
+            if path != self.cached && !staging && path.is_dir() {
+                let _ = fs::remove_dir_all(&path);
+            }
+        }
+    }
+}
+
+/// Whether the environment points fontconfig at a configuration or font
+/// directory other than the prefix's. Steps inherit it, so the key could
+/// not account for what fontconfig reads.
+fn fontconfig_env_overridden() -> bool {
+    #[cfg(test)]
+    if tests::IGNORE_PROCESS_ENV.with(std::cell::Cell::get) {
+        return false;
+    }
+    FONTCONFIG_ENV
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
 }
 
 /// `fonts.conf` and everything else under `etc/fonts`, in a stable order.
@@ -274,13 +312,24 @@ fn copy_files(source: &Path, destination: &Path) -> Result<(), StepError> {
 #[cfg(test)]
 mod tests {
     use super::super::steps::run_step;
-    use super::super::test_support::context;
     use super::*;
     use std::fs::File;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
     use zb_core::{PathBase, PathSpec, StepAction, Sudo};
+
+    thread_local! {
+        /// CI runners set `XDG_CONFIG_HOME`; tests opt out of the process
+        /// environment so they behave the same everywhere.
+        pub(super) static IGNORE_PROCESS_ENV: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    fn context(root: &Path, name: &str, version: &str) -> PostInstallContext {
+        IGNORE_PROCESS_ENV.with(|ignore| ignore.set(true));
+        super::super::test_support::context(root, name, version)
+    }
 
     /// A stand-in for `fc-cache`: counts its runs and writes one cache file
     /// per font file it finds, named after it.
@@ -475,6 +524,58 @@ mod tests {
             FontCache::detect(&empty, OsStr::new("fc-cache"), &[], &no_env).is_none(),
             "without a configuration there is nothing to key on"
         );
+    }
+
+    #[test]
+    fn storing_a_new_key_drops_the_old_ones() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = context(tmp.path(), "fontconfig", "2.18.3");
+        install_fc_cache(&ctx);
+        let fonts = install_config(&ctx, "");
+        touch_dir(&fonts, 0);
+        let keys = || -> Vec<PathBuf> {
+            let mut keys: Vec<PathBuf> = fs::read_dir(ctx.cache.join("fontconfig"))
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .collect();
+            keys.sort();
+            keys
+        };
+
+        run_step(&ctx, &fc_cache_step()).unwrap();
+        let first = keys();
+        assert_eq!(first.len(), 1);
+        let staging = ctx.cache.join("fontconfig/.staging-other");
+        fs::create_dir_all(&staging).unwrap();
+
+        fs::write(fonts.join("b.ttf"), "font").unwrap();
+        touch_dir(&fonts, 1);
+        run_step(&ctx, &fc_cache_step()).unwrap();
+        let second = keys();
+        assert_eq!(second.len(), 2, "one key plus the other store's staging");
+        assert!(
+            second.contains(&staging),
+            "another store's staging is left alone"
+        );
+        assert!(!second.contains(&first[0]), "the stale key is pruned");
+    }
+
+    #[test]
+    fn a_restore_replaces_what_is_in_the_cache_directory() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = context(tmp.path(), "fontconfig", "2.18.3");
+        install_fc_cache(&ctx);
+        let fonts = install_config(&ctx, "");
+        fs::write(fonts.join("a.ttf"), "font").unwrap();
+        run_step(&ctx, &fc_cache_step()).unwrap();
+
+        let out = ctx.prefix.join("var/cache/fontconfig");
+        fs::write(out.join("stale.cache"), "old").unwrap();
+        run_step(&ctx, &fc_cache_step()).unwrap();
+        assert_eq!(runs(&ctx), 1);
+        assert!(!out.join("stale.cache").exists());
+        assert!(out.join("a.ttf.cache").is_file());
     }
 
     #[test]
