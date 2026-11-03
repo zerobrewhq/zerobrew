@@ -24,6 +24,7 @@ use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
 /// Files Homebrew writes into a keg that zerobrew doesn't, or writes differently.
@@ -85,19 +86,38 @@ impl Brew {
         Self::command(&self.bin, args)
     }
 
-    /// Install `formula` and return its keg path.
-    /// Install `formula` at the version the API currently serves and return
-    /// its keg path.
+    /// Refresh the formula API, once per test binary.
     ///
-    /// CI runners ship a Homebrew with a stale API cache and some formulae
-    /// preinstalled, so a plain `brew install` can be a no-op at an older
-    /// version than the one zb resolves. Refresh the API first and upgrade
-    /// whatever is already there. A reference Homebrew named by
-    /// `ZB_PARITY_BREW` is treated as pinned and is not updated.
-    fn install(&self, formula: &str) -> PathBuf {
-        if std::env::var_os("ZB_PARITY_BREW").is_none() {
-            assert_success(&self.run(&["update", "--quiet"]), "brew update");
+    /// CI runners ship a Homebrew with a stale API cache, so without this a
+    /// plain `brew install` can be a no-op at an older version than the one
+    /// zb resolves. Homebrew holds a lock while updating, and on hosted
+    /// runners something else can be holding it for a few seconds after the
+    /// first update; wait for it rather than fail. A reference Homebrew named
+    /// by `ZB_PARITY_BREW` is treated as pinned and is not updated.
+    fn update(&self) {
+        static UPDATED: Once = Once::new();
+        if std::env::var_os("ZB_PARITY_BREW").is_some() {
+            return;
         }
+        UPDATED.call_once(|| {
+            let started = Instant::now();
+            loop {
+                let output = self.run(&["update", "--quiet"]);
+                let busy = String::from_utf8_lossy(&output.stderr)
+                    .contains("Another `brew update` process is already running");
+                if !busy || started.elapsed() > Duration::from_secs(120) {
+                    assert_success(&output, "brew update");
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+    }
+
+    /// Install `formula` at the version the API currently serves and return
+    /// its keg path. Upgrades whatever the runner already has preinstalled.
+    fn install(&self, formula: &str) -> PathBuf {
+        self.update();
         assert_success(
             &self.run(&["install", "--formula", formula]),
             &format!("brew install {formula}"),
@@ -940,8 +960,8 @@ fn install_timings() {
         return;
     };
     let time_homebrew = std::env::var("ZB_TIMING_SKIP_BREW").map_or(true, |v| v.is_empty());
-    if time_homebrew && std::env::var_os("ZB_PARITY_BREW").is_none() {
-        assert_success(&brew.run(&["update", "--quiet"]), "brew update");
+    if time_homebrew {
+        brew.update();
     }
     let release = baseline_zb();
 
