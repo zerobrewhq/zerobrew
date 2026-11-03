@@ -364,3 +364,70 @@ fn only_explicit_init_modifies_shell_configuration() {
         }
     }
 }
+
+#[test]
+#[ignore = "integration test"]
+fn test_handle_configure_php() {
+    let t = TestEnv::new();
+    assert_success(&t.zb(&["install", "php"]), "zb install php");
+
+    let stdout = |args: &[&str]| {
+        let out = t.run_binary("php-config", args);
+        assert_success(&out, "php-config");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let version = stdout(&["--version"]);
+    let mut parts = version.split('.');
+    let major_minor = format!(
+        "{}.{}",
+        parts.next().unwrap(),
+        parts.next().expect("php-config --version has no minor")
+    );
+    // e.g. "20240924" from ".../lib/php/20240924"
+    let api = PathBuf::from(stdout(&["--extension-dir"]))
+        .file_name()
+        .expect("extension dir has no basename")
+        .to_string_lossy()
+        .to_string();
+    let prefix = t.prefix();
+
+    // pecl lives in the prefix so it survives upgrades; the keg points at it.
+    let pecl = prefix.join("lib/php/pecl");
+    assert!(pecl.join(&api).is_dir(), "{} missing", pecl.display());
+    assert_eq!(
+        std::fs::read_link(prefix.join("opt/php/pecl")).expect("opt/php/pecl is not a symlink"),
+        pecl
+    );
+
+    // The pear tree is copied out of the keg and pear is pointed at the copy.
+    let pear = prefix.join("share/pear");
+    assert!(pear.join(".channels").is_dir(), "pear channels missing");
+    let config = t.run_binary("pear", &["config-get", "php_dir"]);
+    assert_success(&config, "pear config-get php_dir");
+    assert_eq!(
+        String::from_utf8_lossy(&config.stdout).trim(),
+        pear.to_str().unwrap()
+    );
+
+    let conf_d = prefix.join(format!("etc/php/{major_minor}/conf.d"));
+    assert!(conf_d.is_dir(), "{} missing", conf_d.display());
+    // OPcache is part of the php binary as of 8.5, so the ini is only written
+    // when the extension is a separate file.
+    let opcache = prefix.join(format!("opt/php/lib/php/{api}/opcache.so"));
+    if opcache.exists() {
+        let ini = std::fs::read_to_string(conf_d.join("ext-opcache.ini"))
+            .expect("ext-opcache.ini missing");
+        assert!(
+            ini.contains(&format!(r#"zend_extension="{}""#, opcache.display())),
+            "unexpected ext-opcache.ini: {ini}"
+        );
+    }
+
+    // php starts with the generated configuration.
+    let out = t.run_binary("php", &["-r", "echo ini_get('extension_dir');"]);
+    assert_success(&out, "php -r");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        stdout(&["--extension-dir"])
+    );
+}
