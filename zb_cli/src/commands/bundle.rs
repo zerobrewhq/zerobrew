@@ -38,8 +38,14 @@ async fn install_from_file(
     );
 
     let start = Instant::now();
+    let mut post_install_failed = Vec::new();
     for formula in formulas {
-        install::execute(installer, vec![formula], no_link, false, ui).await?;
+        let result = install::execute(installer, vec![formula.clone()], no_link, false, ui).await;
+        if let Some(err) =
+            keep_going_after_post_install(result, &formula, &mut post_install_failed)?
+        {
+            ui.error(err).map_err(ui_error)?;
+        }
     }
 
     println!(
@@ -47,7 +53,40 @@ async fn install_from_file(
         style("==>").cyan().bold(),
         start.elapsed().as_secs_f64()
     );
-    Ok(())
+
+    if post_install_failed.is_empty() {
+        return Ok(());
+    }
+    Err(zb_core::Error::ExecutionError {
+        message: format!(
+            "post-install did not finish for: {}",
+            post_install_failed.join(", ")
+        ),
+    })
+}
+
+/// A failed post-install leaves the package installed, so the rest of the
+/// manifest should still be installed. Records the entry and hands the error
+/// back for printing; any other error stops the run.
+fn keep_going_after_post_install(
+    result: Result<(), zb_core::Error>,
+    entry: &str,
+    post_install_failed: &mut Vec<String>,
+) -> Result<Option<zb_core::Error>, zb_core::Error> {
+    match result {
+        Ok(()) => Ok(None),
+        Err(err @ zb_core::Error::PostInstallFailed { .. }) => {
+            post_install_failed.push(entry.to_string());
+            Ok(Some(err))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn ui_error(err: std::io::Error) -> zb_core::Error {
+    zb_core::Error::FileError {
+        message: format!("failed to write CLI output: {err}"),
+    }
 }
 
 fn dump_to_file(
@@ -234,6 +273,47 @@ mod tests {
             parse_brewfile_entry("cask \"docker\""),
             Some("cask:docker".to_string())
         );
+    }
+
+    #[test]
+    fn post_install_failure_does_not_stop_the_manifest() {
+        let mut failed = Vec::new();
+        let err = keep_going_after_post_install(
+            Err(zb_core::Error::PostInstallFailed {
+                name: "php".to_string(),
+                step: "configure_php".to_string(),
+                message: "not supported".to_string(),
+            }),
+            "composer",
+            &mut failed,
+        )
+        .unwrap();
+        assert!(matches!(
+            err,
+            Some(zb_core::Error::PostInstallFailed { .. })
+        ));
+        assert_eq!(failed, vec!["composer"]);
+
+        assert_eq!(
+            keep_going_after_post_install(Ok(()), "jq", &mut failed).unwrap(),
+            None
+        );
+        assert_eq!(failed, vec!["composer"]);
+    }
+
+    #[test]
+    fn other_install_errors_still_stop_the_manifest() {
+        let mut failed = Vec::new();
+        let err = keep_going_after_post_install(
+            Err(zb_core::Error::MissingFormula {
+                name: "nope".to_string(),
+            }),
+            "nope",
+            &mut failed,
+        )
+        .unwrap_err();
+        assert!(matches!(err, zb_core::Error::MissingFormula { .. }));
+        assert!(failed.is_empty());
     }
 
     #[test]
