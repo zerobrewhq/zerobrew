@@ -41,9 +41,7 @@ async fn install_from_file(
     let mut post_install_failed = Vec::new();
     for formula in formulas {
         let result = install::execute(installer, vec![formula.clone()], no_link, false, ui).await;
-        if let Some(err) =
-            keep_going_after_post_install(result, &formula, &mut post_install_failed)?
-        {
+        if let Some(err) = keep_going_after_post_install(result, &mut post_install_failed)? {
             ui.error(err).map_err(ui_error)?;
         }
     }
@@ -66,17 +64,20 @@ async fn install_from_file(
 }
 
 /// A failed post-install leaves the package installed, so the rest of the
-/// manifest should still be installed. Records the entry and hands the error
+/// manifest should still be installed. Records the formula named in the error
+/// (a dependency can be the one that failed) and hands the error
 /// back for printing; any other error stops the run.
 fn keep_going_after_post_install(
     result: Result<(), zb_core::Error>,
-    entry: &str,
     post_install_failed: &mut Vec<String>,
 ) -> Result<Option<zb_core::Error>, zb_core::Error> {
     match result {
         Ok(()) => Ok(None),
         Err(err @ zb_core::Error::PostInstallFailed { .. }) => {
-            post_install_failed.push(entry.to_string());
+            let zb_core::Error::PostInstallFailed { name, .. } = &err else {
+                unreachable!()
+            };
+            post_install_failed.push(name.clone());
             Ok(Some(err))
         }
         Err(err) => Err(err),
@@ -284,7 +285,6 @@ mod tests {
                 step: "configure_php".to_string(),
                 message: "not supported".to_string(),
             }),
-            "composer",
             &mut failed,
         )
         .unwrap();
@@ -292,13 +292,13 @@ mod tests {
             err,
             Some(zb_core::Error::PostInstallFailed { .. })
         ));
-        assert_eq!(failed, vec!["composer"]);
+        assert_eq!(failed, vec!["php"]);
 
         assert_eq!(
-            keep_going_after_post_install(Ok(()), "jq", &mut failed).unwrap(),
+            keep_going_after_post_install(Ok(()), &mut failed).unwrap(),
             None
         );
-        assert_eq!(failed, vec!["composer"]);
+        assert_eq!(failed, vec!["php"]);
     }
 
     #[test]
@@ -308,7 +308,6 @@ mod tests {
             Err(zb_core::Error::MissingFormula {
                 name: "nope".to_string(),
             }),
-            "nope",
             &mut failed,
         )
         .unwrap_err();
