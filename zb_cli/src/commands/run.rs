@@ -76,8 +76,24 @@ pub async fn execute(
         style(&formula).green()
     );
 
-    let mut cmd = Command::new(&bin_path);
-    cmd.args(&args);
+    #[cfg(target_os = "android")]
+    let mut cmd = {
+        let mut c = Command::new("grun");
+        c.arg(&bin_path);
+        c.args(&args);
+        c
+    };
+    #[cfg(not(target_os = "android"))]
+    let mut cmd = {
+        let mut c = Command::new(&bin_path);
+        c.args(&args);
+        c
+    };
+
+    // Termux sets LD_PRELOAD to libtermux-exec-ld-preload.so (a Bionic
+    // library). Glibc binaries cannot load it, so unset it on Android.
+    #[cfg(target_os = "android")]
+    cmd.env_remove("LD_PRELOAD");
 
     if let Some(prefix_path) = detect_runtime_prefix(&bin_path) {
         if let Some(ca_bundle) = zb_io::find_ca_bundle_from_prefix(&prefix_path) {
@@ -89,14 +105,24 @@ pub async fn execute(
             cmd.env("SSL_CERT_DIR", &ca_dir);
         }
 
-        let lib_path = prefix_path.join("lib");
-        if let Ok(existing_ld_path) = std::env::var("LD_LIBRARY_PATH") {
-            cmd.env(
-                "LD_LIBRARY_PATH",
-                format!("{}:{}", lib_path.display(), existing_ld_path),
-            );
-        } else {
-            cmd.env("LD_LIBRARY_PATH", lib_path);
+        #[cfg(target_os = "android")]
+        {
+            let termux_prefix = std::env::var("TERMUX__PREFIX").ok();
+            let lib_dirs = run_lib_dirs(&prefix_path, termux_prefix.as_deref());
+
+            let lib_path = lib_dirs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(":");
+            if let Ok(existing_ld_path) = std::env::var("LD_LIBRARY_PATH") {
+                cmd.env(
+                    "LD_LIBRARY_PATH",
+                    format!("{}:{}", lib_path, existing_ld_path),
+                );
+            } else {
+                cmd.env("LD_LIBRARY_PATH", lib_path);
+            }
         }
     }
 
@@ -105,6 +131,24 @@ pub async fn execute(
     Err(zb_core::Error::ExecutionError {
         message: format!("failed to execute '{}': {}", formula, err),
     })
+}
+
+/// Library directories to expose via LD_LIBRARY_PATH when running a bottle.
+#[cfg(not(target_os = "android"))]
+pub fn run_lib_dirs(prefix_path: &Path) -> Vec<PathBuf> {
+    vec![prefix_path.join("lib")]
+}
+
+/// Library directories to expose via LD_LIBRARY_PATH when running a bottle.
+#[cfg(target_os = "android")]
+pub fn run_lib_dirs(prefix_path: &Path, termux_prefix: Option<&str>) -> Vec<PathBuf> {
+    let mut dirs = vec![prefix_path.join("lib")];
+
+    if let Some(prefix) = termux_prefix {
+        dirs.push(std::path::PathBuf::from(prefix).join("glibc/lib"));
+    }
+
+    dirs
 }
 
 fn detect_runtime_prefix(bin_path: &Path) -> Option<PathBuf> {
@@ -181,8 +225,12 @@ mod tests {
     }
 
     fn get_test_bottle_tag() -> &'static str {
-        if cfg!(target_os = "linux") {
-            "x86_64_linux"
+        if cfg!(target_os = "linux") || cfg!(target_os = "android") {
+            if cfg!(target_arch = "x86_64") {
+                "x86_64_linux"
+            } else {
+                "arm64_linux"
+            }
         } else if cfg!(target_arch = "x86_64") {
             "sonoma"
         } else {
@@ -412,6 +460,13 @@ mod tests {
         let bin_path = PathBuf::from("/tmp/prefix/Cellar/foo/1.0.0/bin/foo");
         let detected = detect_runtime_prefix_with_env(&bin_path, Some("/env/prefix"));
         assert_eq!(detected, Some(PathBuf::from("/env/prefix")));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "android"))]
+    fn run_lib_dirs_includes_prefix_lib() {
+        let dirs = run_lib_dirs(Path::new("/opt/zb/prefix"));
+        assert!(dirs.iter().any(|p| p == Path::new("/opt/zb/prefix/lib")));
     }
 
     #[test]

@@ -165,12 +165,16 @@ impl ApiClient {
     }
 
     fn build_client(base_url: String) -> Self {
-        let client = reqwest::Client::builder()
+        #[allow(unused_mut)]
+        let mut builder = reqwest::Client::builder()
             .user_agent("zerobrew/0.1")
-            .pool_max_idle_per_host(20)
-            .use_preconfigured_tls((*crate::network::tls::shared_tls_config()).clone())
-            .build()
-            .expect("failed to build HTTP client");
+            .pool_max_idle_per_host(20);
+        #[cfg(not(target_os = "android"))]
+        {
+            builder =
+                builder.use_preconfigured_tls((*crate::network::tls::shared_tls_config()).clone());
+        }
+        let client = builder.build().expect("failed to build HTTP client");
 
         Self {
             base_url,

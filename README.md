@@ -291,6 +291,24 @@ doing so.
   </a>
 </div>
 
+## Termux / Android
+
+zerobrew can run on Termux using a glibc sidecar: Linux bottles are reused
+and their ELF interpreter is patched to Termux's glibc loader.
+
+Requirements:
+
+- Enable Termux's glibc repository and install glibc: `pkg install glibc`
+- zerobrew detects the loader at `$TERMUX__PREFIX/glibc/lib/ld-linux-*.so.*`
+- Override detection with `ZEROBREW_GLIBC_LD=/path/to/ld-linux-*.so.*`
+
+Limitations:
+
+- This is not a true Bionic build; packages still link against glibc.
+- If the glibc sidecar is missing, installation fails with a clear error.
+- When a Linux bottle cannot be shimmed, zerobrew suggests `pkg install <pkg>`
+  only when `pkg show <pkg>` confirms availability.
+
 - **Status:** Experimental, but quite useful. I ([@cachebag](https://github.com/cachebag)) daily drive it myself.
 - **Feedback:** If you hit incompatibilities, please open an issue or PR.
 - **License:** Dual-licensed under [Apache 2.0](./LICENSE-APACHE.md) OR [MIT](./LICENSE-MIT.md), at your choice. The source build shim and the post-install runner are derived from Homebrew and are covered by its [BSD 2-Clause license](./LICENSE-HOMEBREW).

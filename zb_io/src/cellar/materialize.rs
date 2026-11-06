@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use zb_core::Error;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::extraction::patch::linux::patch_placeholders;
 
 #[cfg(target_os = "macos")]
@@ -122,7 +122,7 @@ impl Cellar {
         #[cfg(target_os = "macos")]
         relocate_keg(&content, &self.cellar_dir, name, version, build_prefix)?;
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             // Linux bottles are always built in the Linuxbrew prefix, which
             // patch_placeholders handles itself.
@@ -140,7 +140,7 @@ impl Cellar {
             patch_placeholders(&content, prefix, name, version)?;
         }
 
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
         let _ = (content, build_prefix);
 
         Ok(())

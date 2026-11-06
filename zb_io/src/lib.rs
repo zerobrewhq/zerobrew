@@ -12,6 +12,8 @@ pub mod storage;
 pub use build::{BuildExecutor, DepInfo};
 pub use cellar::{Cellar, LinkedFile, Linker, MaterializedKeg};
 pub use extraction::extract_tarball;
+#[cfg(target_os = "android")]
+pub use installer::android_doctor_messages;
 pub use installer::{
     DiagnosticReport, ExecuteResult, HomebrewMigrationPackages, HomebrewPackage, InstallPlan,
     Installer, OutdatedPackage, PlanFailure, PostInstallNotice, RepairSummary, create_installer,

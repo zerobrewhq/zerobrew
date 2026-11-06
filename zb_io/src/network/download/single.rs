@@ -12,6 +12,7 @@ use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
+#[cfg(not(target_os = "android"))]
 use crate::network::tls::shared_tls_config;
 use crate::progress::InstallProgress;
 use crate::storage::blob::BlobCache;
@@ -61,10 +62,15 @@ pub struct Downloader {
 
 impl Downloader {
     pub fn new(blob_cache: BlobCache) -> Self {
-        let client = reqwest::Client::builder()
+        #[allow(unused_mut)]
+        let mut builder = reqwest::Client::builder()
             .user_agent("zerobrew/0.1")
-            .use_preconfigured_tls((*shared_tls_config()).clone())
-            .pool_max_idle_per_host(GLOBAL_DOWNLOAD_CONCURRENCY)
+            .pool_max_idle_per_host(GLOBAL_DOWNLOAD_CONCURRENCY);
+        #[cfg(not(target_os = "android"))]
+        {
+            builder = builder.use_preconfigured_tls((*shared_tls_config()).clone());
+        }
+        let client = builder
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(60))

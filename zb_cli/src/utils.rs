@@ -82,6 +82,42 @@ pub async fn suggest_missing_formula_matches(
     false
 }
 
+/// Pure formatter for the Termux fallback message, kept testable without
+/// spawning `pkg`.
+pub fn format_termux_fallback(formula: &str, pkg_available: bool) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "      {} {}",
+        style(formula).yellow().bold(),
+        style("is not compatible with Termux - homebrew bottles are not available for Android.")
+            .red()
+            .bold()
+    ));
+    out.push('\n');
+    out.push_str(&format!(
+        "      {}",
+        style("and cannot be installed on it.").red().bold()
+    ));
+    if pkg_available {
+        out.push('\n');
+        out.push_str(&format!(
+            "      {}",
+            style(format!("Try: pkg install {}", formula)).cyan()
+        ));
+    }
+    out
+}
+
+/// Whether Termux's `pkg` can install `formula` (checked via `pkg show`).
+pub fn pkg_show_succeeds(formula: &str) -> bool {
+    std::process::Command::new("pkg")
+        .arg("show")
+        .arg(formula)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 pub fn suggest_homebrew(formula: &str, error: &zb_core::Error) {
     eprintln!();
     eprintln!(
@@ -95,19 +131,10 @@ pub fn suggest_homebrew(formula: &str, error: &zb_core::Error) {
     // doesn't support bottles for this platform
     // details: https://github.com/zerobrewhq/zerobrew/pull/136
     if cfg!(target_os = "android") {
-        eprintln!(
-            "      {} {}",
-            style(formula).yellow().bold(),
-            style(
-                "is not compatible with Termux - homebrew bottles are not available for Android."
-            )
-            .red()
-            .bold()
-        );
-        eprintln!(
-            "      {}",
-            style("and cannot be installed on it.").red().bold()
-        );
+        let pkg_available = pkg_show_succeeds(formula);
+        for line in format_termux_fallback(formula, pkg_available).lines() {
+            eprintln!("{}", line);
+        }
     } else {
         eprintln!("      Try installing with Homebrew instead:");
         eprintln!(
@@ -193,8 +220,8 @@ mod tests {
     use zb_io::{Installer, Linker};
 
     use super::{
-        format_formula_suggestions, get_prefix_path_for_os, normalize_formula_name,
-        suggest_missing_formula_matches,
+        format_formula_suggestions, format_termux_fallback, get_prefix_path_for_os,
+        normalize_formula_name, suggest_missing_formula_matches,
     };
 
     #[test]
@@ -233,6 +260,20 @@ mod tests {
             get_prefix_path_for_os(Some(custom.clone()), &root, true),
             custom
         );
+    }
+
+    #[test]
+    fn termux_fallback_suggests_pkg_when_available() {
+        let msg = format_termux_fallback("jq", true);
+        assert!(msg.contains("pkg install jq"));
+        assert!(!msg.contains("brew install"));
+    }
+
+    #[test]
+    fn termux_fallback_omits_suggestion_when_unavailable() {
+        let msg = format_termux_fallback("jq", false);
+        assert!(!msg.contains("pkg install"));
+        assert!(!msg.contains("brew install"));
     }
 
     #[test]

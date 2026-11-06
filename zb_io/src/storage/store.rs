@@ -132,9 +132,17 @@ impl Store {
         let lock_path = self.locks_dir.join(format!("{store_key}.lock"));
         let lock_file =
             File::create(&lock_path).map_err(Error::store("failed to create lock file"))?;
-        lock_file
-            .lock()
-            .map_err(Error::store("failed to acquire lock"))?;
+        if let Err(e) = lock_file.lock() {
+            #[cfg(target_os = "android")]
+            {
+                tracing::warn!(error = %e, "store lock not supported on this filesystem; proceeding unlocked");
+                return Ok(lock_file);
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                return Err(Error::store("failed to acquire lock")(e));
+            }
+        }
         Ok(lock_file)
     }
 

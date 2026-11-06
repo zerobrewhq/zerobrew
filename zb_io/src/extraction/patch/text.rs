@@ -16,7 +16,7 @@ use super::phar;
 /// Other files with NUL bytes in their first 8 KiB are treated as binaries
 /// and left alone. PHP archives get their signature recomputed after
 /// patching. Returns whether the file changed.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 pub(crate) fn rewrite_text_file(path: &Path, replacements: &[(&str, &str)]) -> io::Result<bool> {
     if is_binary(path)? {
         return Ok(false);

@@ -35,9 +35,13 @@ BENCH_QUICK_PACKAGES := 'jq tree htop bat fd ripgrep fzf wget curl git tmux zoxi
 BENCH_BANDWIDTH_PACKAGE := 'go'
 
 alias b := build
+alias ba := build-android
 alias i := install
+alias ia := install-android
 alias t := test
+alias ta := test-android
 alias l := lint
+alias la := lint-android
 alias f := fmt
 
 [doc('List available recipes')]
@@ -48,6 +52,16 @@ default:
 [group('build')]
 build: fmt-check lint
     cargo build --bin zb --bin zbx --bin zb-brew
+
+[doc('Build the zb binary with Android Support')]
+[group('build')]
+build-android: fmt-check lint-android
+    CC_aarch64_linux_android={{justfile_directory()}}/clang.shim \
+    CXX_aarch64_linux_android={{justfile_directory()}}/clang.shim \
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER={{justfile_directory()}}/clang.shim \
+    PKG_CONFIG_ALLOW_CROSS=1 \
+    PKG_CONFIG_PATH=$TERMUX__PREFIX/lib/pkgconfig \
+    cargo build --release --features=android-support --bin zb --bin zbx --bin zb-brew
 
 [doc('Install zb to $ZEROBREW_BIN')]
 [group('install')]
@@ -64,6 +78,27 @@ install: build
     install -Dm755 target/debug/zb "$ZEROBREW_BIN/zb"
     install -Dm755 target/debug/zbx "$ZEROBREW_BIN/zbx"
     install -Dm755 target/debug/zb-brew "$ZEROBREW_BIN/zb-brew"
+    echo "Installed zb to $ZEROBREW_BIN/zb"
+    echo "Installed zbx to $ZEROBREW_BIN/zbx"
+    echo "Installed zb-brew to $ZEROBREW_BIN/zb-brew (enable with zb install-alias brew)"
+
+    "$ZEROBREW_BIN/zb" init
+
+[doc('Install zb with Android Support to $ZEROBREW_BIN')]
+[group('install')]
+[script]
+install-android: build-android
+    if [[ -d "$ZEROBREW_PREFIX/lib/pkgconfig" ]]; then
+        export PKG_CONFIG_PATH="$ZEROBREW_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+    fi
+    if [[ -d '/opt/homebrew/lib/pkgconfig' ]] && [[ ! "$PKG_CONFIG_PATH" =~ '/opt/homebrew/lib/pkgconfig' ]]; then
+        export PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+    fi
+
+    mkdir -p "$ZEROBREW_BIN"
+    install -Dm755 target/aarch64-linux-android/release/zb "$ZEROBREW_BIN/zb"
+    install -Dm755 target/aarch64-linux-android/release/zbx "$ZEROBREW_BIN/zbx"
+    install -Dm755 target/aarch64-linux-android/release/zb-brew "$ZEROBREW_BIN/zb-brew"
     echo "Installed zb to $ZEROBREW_BIN/zb"
     echo "Installed zbx to $ZEROBREW_BIN/zbx"
     echo "Installed zb-brew to $ZEROBREW_BIN/zb-brew (enable with zb install-alias brew)"
@@ -214,10 +249,30 @@ fmt-check:
 lint:
     cargo clippy --workspace -- -D warnings
 
+[doc('Run Clippy linter with Android Support')]
+[group('lint')]
+lint-android:
+    CC_aarch64_linux_android={{justfile_directory()}}/clang.shim \
+    CXX_aarch64_linux_android={{justfile_directory()}}/clang.shim \
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER={{justfile_directory()}}/clang.shim \
+    PKG_CONFIG_ALLOW_CROSS=1 \
+    PKG_CONFIG_PATH=$TERMUX__PREFIX/lib/pkgconfig \
+    cargo clippy --release --workspace -- -D warnings
+
 [doc('Run all tests')]
 [group('test')]
 test:
     cargo test --workspace -- --include-ignored
+
+[doc('Run all tests for Android')]
+[group('test')]
+test-android: build-android
+    CC_aarch64_linux_android={{justfile_directory()}}/clang.shim \
+    CXX_aarch64_linux_android={{justfile_directory()}}/clang.shim \
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER={{justfile_directory()}}/clang.shim \
+    PKG_CONFIG_ALLOW_CROSS=1 \
+    PKG_CONFIG_PATH=$TERMUX__PREFIX/lib/pkgconfig \
+    cargo test --release --workspace --no-fail-fast --features=android-support -- --include-ignored
 
 [doc('Benchmark zerobrew against Homebrew (resets zerobrew; see --help)')]
 [group('benchmark')]
