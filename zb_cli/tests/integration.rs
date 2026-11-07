@@ -409,12 +409,12 @@ fn test_handle_configure_php() {
         pear.to_str().unwrap()
     );
 
+    // `conf.d` and its ini belong to the versioned `php@*` kegs; unversioned
+    // `php` stops before them, and OPcache is part of the binary as of 8.5, so
+    // the ini only exists when the extension is a separate file.
     let conf_d = prefix.join(format!("etc/php/{major_minor}/conf.d"));
-    assert!(conf_d.is_dir(), "{} missing", conf_d.display());
-    // OPcache is part of the php binary as of 8.5, so the ini is only written
-    // when the extension is a separate file.
     let opcache = prefix.join(format!("opt/php/lib/php/{api}/opcache.so"));
-    if opcache.exists() {
+    if conf_d.is_dir() && opcache.exists() {
         let ini = std::fs::read_to_string(conf_d.join("ext-opcache.ini"))
             .expect("ext-opcache.ini missing");
         assert!(
@@ -423,11 +423,19 @@ fn test_handle_configure_php() {
         );
     }
 
-    // php starts with the generated configuration.
+    // php starts with the generated configuration. `php-config` reports the
+    // path through the keg's `pecl` symlink, php reports it resolved, so only
+    // the target has to match.
     let out = t.run_binary("php", &["-r", "echo ini_get('extension_dir');"]);
     assert_success(&out, "php -r");
+    let canon = |path: &std::path::Path| {
+        std::fs::canonicalize(path)
+            .unwrap_or_else(|e| panic!("canonicalize {}: {e}", path.display()))
+    };
     assert_eq!(
-        String::from_utf8_lossy(&out.stdout).trim(),
-        stdout(&["--extension-dir"])
+        canon(std::path::Path::new(
+            String::from_utf8_lossy(&out.stdout).trim()
+        )),
+        canon(&pecl.join(&api))
     );
 }
