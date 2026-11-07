@@ -2,12 +2,13 @@
 
 use std::fs;
 use std::io::{self, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use memchr::memmem;
 
-use super::phar;
+use super::{phar, php_serialize};
 
 /// Replace each `(from, to)` pair in the file at `path`, in order.
 ///
@@ -15,7 +16,8 @@ use super::phar;
 /// data, as Homebrew does: PHP archives are scripts with a binary payload.
 /// Other files with NUL bytes in their first 8 KiB are treated as binaries
 /// and left alone. PHP archives get their signature recomputed after
-/// patching. Returns whether the file changed.
+/// patching, and PHP-serialized data its string lengths. Returns whether the
+/// file changed.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn rewrite_text_file(path: &Path, replacements: &[(&str, &str)]) -> io::Result<bool> {
     if is_binary(path)? {
@@ -40,6 +42,13 @@ pub(crate) fn rewrite_text(path: &Path, replacements: &[(&str, &str)]) -> io::Re
     if !changed {
         return Ok(false);
     }
+    // PEAR's config and registry are the only PHP-serialized files a keg
+    // ships; anywhere else `s:<n>:"` is ordinary text.
+    if is_pear_data(path)
+        && let Some(repaired) = php_serialize::fix_lengths(&content)
+    {
+        content = repaired;
+    }
     if let Some(resigned) = phar::resign(&content) {
         content = resigned;
     }
@@ -55,6 +64,13 @@ pub(crate) fn is_binary(path: &Path) -> io::Result<bool> {
     let mut head = [0u8; 8192];
     let n = fs::File::open(path)?.read(&mut head)?;
     Ok(head[..n].contains(&0) && !head[..n].starts_with(b"#!"))
+}
+
+/// Whether `path` is PEAR data: `etc/pear.conf` or anything under a `pear`
+/// directory, which is where its registry, channels and depdb live.
+fn is_pear_data(path: &Path) -> bool {
+    path.components()
+        .any(|c| c.as_os_str().as_bytes().starts_with(b"pear"))
 }
 
 fn replace_all(haystack: &[u8], from: &[u8], to: &[u8]) -> Option<Vec<u8>> {
@@ -178,6 +194,28 @@ mod tests {
         let file = tmp.path().join("README");
         fs::write(&file, "nothing to see\n").unwrap();
         assert!(!rewrite_text_file(&file, PLACEHOLDERS).unwrap());
+    }
+
+    #[test]
+    fn fixes_serialized_lengths_only_in_pear_data() {
+        let tmp = TempDir::new().unwrap();
+        let data = br#"a:1:{s:4:"path";s:19:"@@HOMEBREW_PREFIX@@";}"#;
+
+        let conf = tmp.path().join("pear.conf");
+        fs::write(&conf, data).unwrap();
+        assert!(rewrite_text_file(&conf, PLACEHOLDERS).unwrap());
+        assert_eq!(
+            fs::read_to_string(&conf).unwrap(),
+            r#"a:1:{s:4:"path";s:13:"/opt/zerobrew";}"#
+        );
+
+        let other = tmp.path().join("other.conf");
+        fs::write(&other, data).unwrap();
+        assert!(rewrite_text_file(&other, PLACEHOLDERS).unwrap());
+        assert_eq!(
+            fs::read_to_string(&other).unwrap(),
+            r#"a:1:{s:4:"path";s:19:"/opt/zerobrew";}"#
+        );
     }
 
     #[test]
