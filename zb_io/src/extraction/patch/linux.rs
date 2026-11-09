@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -13,6 +13,9 @@ use super::text;
 
 const LINUX_HOMEBREW_PREFIX: &str = "/home/linuxbrew/.linuxbrew";
 
+/// `(old_prefix, new_prefix)` pairs for string replacement.
+type Subs<'a> = Vec<(&'a str, &'a str)>;
+
 /// Patch @@HOMEBREW_CELLAR@@ and @@HOMEBREW_PREFIX@@ placeholders in both ELF binaries and text files.
 #[cfg(target_os = "linux")]
 pub fn patch_placeholders(
@@ -22,8 +25,78 @@ pub fn patch_placeholders(
     _pkg_version: &str,
 ) -> Result<(), Error> {
     patch_elf_placeholders(keg_path, prefix_dir)?;
+    patch_binary_placeholders(keg_path, prefix_dir)?;
     patch_text_placeholders(keg_path, prefix_dir)?;
     Ok(())
+}
+
+/// Rewrite the build prefix baked into binaries' *strings*, which the ELF
+/// pass does not touch: php's `php.ini` path and `extension_dir`, for
+/// example, live in `.rodata`, not in RPATH. Length-preserving, like the
+/// macOS pass; the Linuxbrew prefix is long enough that any real prefix
+/// fits. Paths that do not fit are reported, not truncated.
+fn patch_binary_placeholders(keg_path: &Path, prefix_dir: &Path) -> Result<(), Error> {
+    let prefix_str = prefix_dir.to_string_lossy().into_owned();
+    let cellar_str = prefix_dir.join("Cellar").to_string_lossy().into_owned();
+    let all = [
+        ("@@HOMEBREW_PREFIX@@", prefix_str.as_str()),
+        ("@@HOMEBREW_REPOSITORY@@", prefix_str.as_str()),
+        (LINUX_HOMEBREW_PREFIX, prefix_str.as_str()),
+        ("@@HOMEBREW_CELLAR@@", cellar_str.as_str()),
+    ];
+    let (replacements, too_long): (Subs, Subs) = all
+        .into_iter()
+        .partition(|(old, new)| new.len() <= old.len());
+    for (old, new) in &too_long {
+        warn!(
+            old_prefix = old,
+            new_prefix = new,
+            "binaries' hardcoded {old} paths cannot be rewritten to {new} (new path is \
+             longer); this package may not work correctly. tracking issue: \
+             https://github.com/zerobrewhq/zerobrew/issues/286"
+        );
+    }
+    if replacements.is_empty() {
+        return Ok(());
+    }
+
+    let binaries: Vec<PathBuf> = walkdir::WalkDir::new(keg_path)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().to_path_buf())
+        .filter(|p| text::is_binary(p).unwrap_or(false))
+        .collect();
+
+    binaries.par_iter().for_each(|path| {
+        if let Err(e) = replace_prefixes_in_binary(path, &replacements) {
+            warn!(path = %path.display(), error = %e, "failed to patch binary paths");
+        }
+    });
+
+    Ok(())
+}
+
+/// Replace each `(old, new)` path prefix in one binary file, in place: `new`
+/// is `/`-padded to `old`'s length so the file's layout (ELF headers,
+/// section offsets) is untouched. Pairs whose `new` is longer than `old`
+/// cannot be written in place and are skipped. Returns whether it changed.
+fn replace_prefixes_in_binary(path: &Path, replacements: &[(&str, &str)]) -> io::Result<bool> {
+    let mut content = fs::read(path)?;
+    let mut changed = false;
+    for (old, new) in replacements {
+        if old == new || new.len() > old.len() {
+            continue;
+        }
+        if !text::replace_prefix_in_place(&mut content, old.as_bytes(), new.as_bytes()).is_empty() {
+            changed = true;
+        }
+    }
+    if changed {
+        text::write_preserving_mode(path, &content)?;
+    }
+    Ok(changed)
 }
 
 fn rewrite_homebrew_prefixes(input: &str, prefix_dir: &Path) -> String {
@@ -364,6 +437,37 @@ mod tests {
 
     use std::process::Command;
     use tempfile::TempDir;
+
+    #[test]
+    fn rewrites_binary_paths_in_place_and_keeps_the_length() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("php");
+        let original = b"\0\x01/home/linuxbrew/.linuxbrew/etc/php\0/opt/other\0".to_vec();
+        fs::write(&file, &original).unwrap();
+
+        assert!(
+            replace_prefixes_in_binary(
+                &file,
+                &[
+                    (LINUX_HOMEBREW_PREFIX, "/tmp/zbx"),
+                    // Longer than its placeholder: skipped, not truncated.
+                    ("@@HOMEBREW_CELLAR@@", "/tmp/zbx/Cellar/very/long"),
+                ],
+            )
+            .unwrap()
+        );
+
+        let patched = fs::read(&file).unwrap();
+        assert_eq!(patched.len(), original.len());
+        assert_eq!(
+            patched,
+            b"\0\x01/tmp/zbx///////////////////etc/php\0/opt/other\0".to_vec()
+        );
+        // A second run has nothing left to do.
+        assert!(
+            !replace_prefixes_in_binary(&file, &[(LINUX_HOMEBREW_PREFIX, "/tmp/zbx")]).unwrap()
+        );
+    }
 
     fn compile_dummy_elf(dir: &Path, name: &str) -> Option<PathBuf> {
         let src_path = dir.join(format!("{}.c", name));

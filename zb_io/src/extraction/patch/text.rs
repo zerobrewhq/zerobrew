@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io::{self, Read};
+use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -57,6 +58,35 @@ pub(crate) fn rewrite_text(path: &Path, replacements: &[(&str, &str)]) -> io::Re
     Ok(true)
 }
 
+/// Replace `old` with `new` wherever it starts a path in `contents`: it is
+/// followed by the end of the data, a NUL, a `/` or a `:`. A shorter `new`
+/// is padded with `/` to keep the file layout, as Homebrew does, so the rest
+/// of the path is still reachable. Returns the byte ranges that changed.
+pub(crate) fn replace_prefix_in_place(
+    contents: &mut [u8],
+    old: &[u8],
+    new: &[u8],
+) -> Vec<Range<usize>> {
+    debug_assert!(new.len() <= old.len());
+    let finder = memmem::Finder::new(old);
+    let mut ranges = Vec::new();
+    let mut from = 0;
+    while let Some(found) = finder.find(&contents[from..]) {
+        let start = from + found;
+        let end = start + old.len();
+        let boundary = matches!(contents.get(end), None | Some(0) | Some(b'/') | Some(b':'));
+        if boundary {
+            contents[start..start + new.len()].copy_from_slice(new);
+            contents[start + new.len()..end].fill(b'/');
+            ranges.push(start..end);
+            from = end;
+        } else {
+            from = start + 1;
+        }
+    }
+    ranges
+}
+
 /// Whether `path` is a binary file: it has a NUL byte in its first 8 KiB and
 /// is not a `#!` script. This is the split Homebrew uses between files it
 /// rewrites freely and files whose strings must be replaced in place.
@@ -94,7 +124,7 @@ fn replace_all(haystack: &[u8], from: &[u8], to: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn write_preserving_mode(path: &Path, content: &[u8]) -> io::Result<()> {
+pub(crate) fn write_preserving_mode(path: &Path, content: &[u8]) -> io::Result<()> {
     let permissions = fs::metadata(path)?.permissions();
     let mode = permissions.mode();
     let readonly = mode & 0o200 == 0;
@@ -117,6 +147,20 @@ mod tests {
         ("@@HOMEBREW_PREFIX@@", "/opt/zerobrew"),
         ("/opt/homebrew", "/opt/zerobrew"),
     ];
+
+    #[test]
+    fn replace_prefix_in_place_only_matches_whole_path_components() {
+        let mut data =
+            b"/opt/homebrew/lib\0/opt/homebrewery\0/opt/homebrew:/x\0/opt/homebrew".to_vec();
+
+        let ranges = replace_prefix_in_place(&mut data, b"/opt/homebrew", b"/opt/zb");
+
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(
+            data,
+            b"/opt/zb///////lib\0/opt/homebrewery\0/opt/zb//////:/x\0/opt/zb//////".to_vec()
+        );
+    }
 
     #[test]
     fn rewrites_placeholders_and_prefix_in_text() {
