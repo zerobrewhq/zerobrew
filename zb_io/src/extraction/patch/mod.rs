@@ -7,6 +7,7 @@ pub mod macos;
 #[cfg(target_os = "macos")]
 pub(crate) mod macho;
 mod phar;
+mod php_serialize;
 pub(crate) mod text;
 
 #[cfg(target_os = "linux")]

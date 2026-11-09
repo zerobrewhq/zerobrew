@@ -335,6 +335,7 @@ pub enum StepAction {
     CompileGsettingsSchemas {
         path: PathSpec,
     },
+    ConfigurePhp,
     GioQuerymodules {
         path: PathSpec,
     },
@@ -381,6 +382,7 @@ const KNOWN_KINDS: &[&str] = &[
     "install_gzipped_executable",
     "configure_clang_system",
     "configure_gcc_runtime",
+    "configure_php",
     "compile_gsettings_schemas",
     "gio_querymodules",
     "gdk_pixbuf_query_loaders",
@@ -413,6 +415,7 @@ impl StepAction {
             StepAction::InstallGzippedExecutable { .. } => "install_gzipped_executable",
             StepAction::ConfigureClangSystem => "configure_clang_system",
             StepAction::ConfigureGccRuntime => "configure_gcc_runtime",
+            StepAction::ConfigurePhp => "configure_php",
             StepAction::CompileGsettingsSchemas { .. } => "compile_gsettings_schemas",
             StepAction::GioQuerymodules { .. } => "gio_querymodules",
             StepAction::GdkPixbufQueryLoaders => "gdk_pixbuf_query_loaders",

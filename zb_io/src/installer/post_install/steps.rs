@@ -20,6 +20,8 @@ use regex::Regex;
 use tracing::{debug, warn};
 use zb_core::{PathSpec, ProcessMatch, StepAction, Sudo};
 
+use crate::installer::post_install::php;
+
 use super::ca_bundle::CaBundle;
 use super::font_cache::FontCache;
 use super::paths::{self, expand_glob, resolve};
@@ -230,6 +232,7 @@ pub(super) fn run_step(
                 ));
             }
         }
+        StepAction::ConfigurePhp => php::configure_php(ctx)?,
         StepAction::CompileGsettingsSchemas { path } => run_formula_tool(
             ctx,
             "glib",

@@ -21,6 +21,7 @@ pub use ca_bundle::known_ca_bundle_script;
 mod clang;
 mod font_cache;
 mod paths;
+mod php;
 mod steps;
 mod template;
 
