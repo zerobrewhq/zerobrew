@@ -289,17 +289,15 @@ fn patch_elf_placeholders(keg_path: &Path, prefix_dir: &Path) -> Result<(), Erro
             }
 
             // Atomic write
-            let temp_path = path.with_extension("tmp_patch");
-            {
-                let mut temp_file = fs::File::create(&temp_path)?;
-                elf.write(&mut temp_file)?;
-            }
-            fs::rename(temp_path, path)?;
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
+            elf.write(temp_file.as_file_mut())?;
 
-            // Restore original permissions (including execute bit) after atomic write
             let mut perms = metadata.permissions();
             perms.set_mode(original_mode);
-            fs::set_permissions(path, perms)?;
+            temp_file.as_file().set_permissions(perms)?;
+
+            temp_file.persist(path).map_err(|e| e.error)?;
 
             Ok(())
         })();
@@ -476,6 +474,69 @@ mod tests {
             new_mode & 0o777,
             "permissions should be preserved after patching"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn patches_sibling_elfs_sharing_a_name_prefix() {
+        // Regression: the temp file used to be `path.with_extension("tmp_patch")`,
+        // so `mkfs.a`, `mkfs.b`, ... all mapped to `mkfs.tmp_patch` and raced
+        // when patched in parallel.
+        let tmp = TempDir::new().unwrap();
+        let prefix = tmp.path().join("prefix");
+        let pkg_dir = prefix.join("Cellar/testpkg/1.0.0");
+        let bin_dir = pkg_dir.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        let names: Vec<String> = (0..32).map(|i| format!("mkfs.fs{i}")).collect();
+        let mut elfs = Vec::new();
+        for name in &names {
+            match compile_dummy_elf(&bin_dir, name) {
+                Some(p) => elfs.push(p),
+                None => {
+                    eprintln!("Skipping ELF patch test: cc not found");
+                    return;
+                }
+            }
+        }
+        let modes: Vec<u32> = elfs
+            .iter()
+            .map(|p| fs::metadata(p).unwrap().permissions().mode() & 0o777)
+            .collect();
+
+        patch_placeholders(&pkg_dir, &prefix, "testpkg", "1.0.0").unwrap();
+
+        let expected_rpath = prefix.join("lib").to_string_lossy().into_owned();
+        for (elf_path, mode) in elfs.iter().zip(modes) {
+            let content = fs::read(elf_path).unwrap();
+            let elf = arwen::elf::ElfContainer::parse(&content)
+                .unwrap_or_else(|e| panic!("{} is not a valid ELF: {e}", elf_path.display()));
+            let rpaths = elf.get_rpath();
+            assert!(
+                rpaths
+                    .iter()
+                    .any(|r| r.split(':').any(|r| r == expected_rpath))
+                    && rpaths.iter().all(|r| !r.contains("@@HOMEBREW_")),
+                "{} was not patched, rpath = {rpaths:?}",
+                elf_path.display()
+            );
+            assert_eq!(
+                fs::metadata(elf_path).unwrap().permissions().mode() & 0o777,
+                mode,
+                "mode changed for {}",
+                elf_path.display()
+            );
+        }
+
+        let mut entries: Vec<String> = fs::read_dir(&bin_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.ends_with(".c"))
+            .collect();
+        entries.sort();
+        let mut expected = names.clone();
+        expected.sort();
+        assert_eq!(entries, expected, "unexpected leftover files in bin/");
     }
 
     fn elf_header(data: u8, e_type: u16) -> Vec<u8> {
