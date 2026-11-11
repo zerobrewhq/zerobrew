@@ -317,7 +317,10 @@ export ZEROBREW_DIR={zerobrew_dir}
 export ZEROBREW_BIN={zerobrew_bin}
 export ZEROBREW_ROOT={root}
 export ZEROBREW_PREFIX={prefix}
-export PKG_CONFIG_PATH="$ZEROBREW_PREFIX/lib/pkgconfig:${{PKG_CONFIG_PATH:-}}"
+case ":${{PKG_CONFIG_PATH:-}}:" in
+  *:"$ZEROBREW_PREFIX/lib/pkgconfig":*) ;;
+  *) export PKG_CONFIG_PATH="$ZEROBREW_PREFIX/lib/pkgconfig${{PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}}" ;;
+esac
 
 # SSL/TLS certificates (only if ca-certificates is installed)
 if [ -z "${{CURL_CA_BUNDLE:-}}" ] || [ -z "${{SSL_CERT_FILE:-}}" ]; then
@@ -371,10 +374,8 @@ set -gx ZEROBREW_DIR {zerobrew_dir}
 set -gx ZEROBREW_BIN {zerobrew_bin}
 set -gx ZEROBREW_ROOT {root}
 set -gx ZEROBREW_PREFIX {prefix}
-if set -q PKG_CONFIG_PATH
+if not contains -- "$ZEROBREW_PREFIX/lib/pkgconfig" $PKG_CONFIG_PATH
     set -gx PKG_CONFIG_PATH "$ZEROBREW_PREFIX/lib/pkgconfig" $PKG_CONFIG_PATH
-else
-    set -gx PKG_CONFIG_PATH "$ZEROBREW_PREFIX/lib/pkgconfig"
 end
 
 # SSL/TLS certificates (only if ca-certificates is installed)
@@ -757,6 +758,49 @@ mod tests {
     }
 
     #[test]
+    fn add_to_path_posix_block_adds_pkg_config_path_once_when_sourced_twice() {
+        let _lock = env_lock();
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let prefix = tmp.path().join("prefix");
+        let root = tmp.path().join("root");
+        let shell_config = home.join(".bashrc");
+
+        fs::create_dir(&prefix).unwrap();
+        fs::create_dir(&root).unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", home.to_str().unwrap());
+            std::env::set_var("SHELL", "/bin/bash");
+        }
+
+        add_to_path(&prefix, "/zb", "/zb/bin", &root, false).unwrap();
+
+        let pkg_dir = format!("{}/lib/pkgconfig", prefix.display());
+        let source_twice = |initial: Option<&str>| {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg(r#". "$1"; . "$1"; printf '%s' "$PKG_CONFIG_PATH""#)
+                .arg("sh")
+                .arg(&shell_config);
+            match initial {
+                Some(value) => cmd.env("PKG_CONFIG_PATH", value),
+                None => cmd.env_remove("PKG_CONFIG_PATH"),
+            };
+            let output = cmd.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+
+        assert_eq!(source_twice(None), pkg_dir);
+        assert_eq!(source_twice(Some("")), pkg_dir);
+        assert_eq!(
+            source_twice(Some("/other/pkgconfig")),
+            format!("{pkg_dir}:/other/pkgconfig")
+        );
+    }
+
+    #[test]
     fn add_to_path_includes_path_append_function() {
         let _lock = env_lock();
         let tmp = TempDir::new().unwrap();
@@ -1103,7 +1147,10 @@ mod tests {
         assert!(content.contains("set -q SSL_CERT_FILE; or set -gx SSL_CERT_FILE"));
         assert!(content.contains("$ZEROBREW_PREFIX/etc/openssl/cert.pem"));
         assert!(content.contains("$ZEROBREW_PREFIX/etc/openssl/certs"));
-        assert!(content.contains("if set -q PKG_CONFIG_PATH"));
+        assert!(
+            content
+                .contains("if not contains -- \"$ZEROBREW_PREFIX/lib/pkgconfig\" $PKG_CONFIG_PATH")
+        );
         assert!(content.contains(
             "set -gx PKG_CONFIG_PATH \"$ZEROBREW_PREFIX/lib/pkgconfig\" $PKG_CONFIG_PATH"
         ));
