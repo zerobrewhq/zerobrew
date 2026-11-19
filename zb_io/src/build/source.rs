@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tokio::fs;
 use zb_core::Error;
@@ -71,9 +72,24 @@ fn source_file_name(url: &str, formula_name: &str) -> String {
     }
 }
 
+// Fail a source download only when the connection cannot be established or
+// no bytes arrive for this long; the total transfer time is not capped.
+const SOURCE_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const SOURCE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 async fn download_source(url: &str, dest: &Path) -> Result<(), Error> {
+    download_source_with(url, dest, SOURCE_CONNECT_TIMEOUT, SOURCE_IDLE_TIMEOUT).await
+}
+
+async fn download_source_with(
+    url: &str,
+    dest: &Path,
+    connect_timeout: Duration,
+    idle_timeout: Duration,
+) -> Result<(), Error> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        .connect_timeout(connect_timeout)
+        .read_timeout(idle_timeout)
         .use_preconfigured_tls((*crate::network::tls::shared_tls_config()).clone())
         .build()
         .map_err(Error::network("failed to create HTTP client"))?;
@@ -91,10 +107,18 @@ async fn download_source(url: &str, dest: &Path) -> Result<(), Error> {
         });
     }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(Error::network("failed to read source response"))?;
+    let bytes = response.bytes().await.map_err(|e| {
+        if e.is_timeout() {
+            Error::NetworkFailure {
+                message: format!(
+                    "source download from {url} timed out after {}s without receiving data",
+                    idle_timeout.as_secs()
+                ),
+            }
+        } else {
+            Error::network("failed to read source response")(e)
+        }
+    })?;
 
     fs::write(dest, &bytes)
         .await
@@ -184,6 +208,78 @@ mod tests {
         assert_eq!(
             source_file_name("https://example.com/a/../", "tool"),
             "tool"
+        );
+    }
+
+    /// Serve a 200 response whose body arrives in `chunks` pieces, sleeping
+    /// `gap` before each one. With `stall`, send the headers then hang.
+    async fn trickle_server(chunks: usize, gap: Duration, stall: bool) -> String {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+                    let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {chunks}\r\n\r\n");
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    if stall {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        return;
+                    }
+                    for _ in 0..chunks {
+                        tokio::time::sleep(gap).await;
+                        if sock.write_all(b"x").await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://{addr}/src")
+    }
+
+    #[tokio::test]
+    async fn slow_but_steady_download_outlives_idle_timeout() {
+        // 20 chunks * 50ms = ~1s total, well over the 400ms idle limit,
+        // but no single gap exceeds it.
+        let url = trickle_server(20, Duration::from_millis(50), false).await;
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("out");
+
+        download_source_with(
+            &url,
+            &dest,
+            Duration::from_secs(5),
+            Duration::from_millis(400),
+        )
+        .await
+        .expect("steady slow transfer must not time out");
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"x".repeat(20));
+    }
+
+    #[tokio::test]
+    async fn stalled_download_fails_with_timeout_error() {
+        let url = trickle_server(10, Duration::from_millis(1), true).await;
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("out");
+
+        let started = std::time::Instant::now();
+        let err = download_source_with(
+            &url,
+            &dest,
+            Duration::from_secs(5),
+            Duration::from_millis(150),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected a timeout error, got: {err}"
         );
     }
 
