@@ -17,6 +17,7 @@ pub async fn execute(
     if packages.formulas.is_empty()
         && packages.non_core_formulas.is_empty()
         && packages.casks.is_empty()
+        && packages.unresolved.is_empty()
     {
         ui.println("No Homebrew packages installed.")
             .map_err(ui_error)?;
@@ -40,6 +41,10 @@ pub async fn execute(
                 .map_err(ui_error)?;
         }
         ui.blank_line().map_err(ui_error)?;
+    }
+
+    if !packages.unresolved.is_empty() {
+        print_unresolved(ui, &packages.unresolved)?;
     }
 
     if !packages.casks.is_empty() {
@@ -133,6 +138,10 @@ pub async fn execute(
             ui.bullet(name).map_err(ui_error)?;
         }
         ui.blank_line().map_err(ui_error)?;
+    }
+
+    if !packages.unresolved.is_empty() {
+        print_unresolved(ui, &packages.unresolved)?;
     }
 
     if success_count == 0 {
@@ -232,6 +241,18 @@ pub async fn execute(
     }
 
     Ok(())
+}
+
+fn print_unresolved(ui: &mut StdUi, names: &[String]) -> Result<(), zb_core::Error> {
+    ui.note(format!(
+        "Skipped {} formula(s) that `brew info` could not find (removed from homebrew-core?):",
+        names.len()
+    ))
+    .map_err(ui_error)?;
+    for name in names {
+        ui.bullet(name).map_err(ui_error)?;
+    }
+    ui.blank_line().map_err(ui_error)
 }
 
 // FIXME: Abstract this return type to a more structured type (e.g., a struct)
