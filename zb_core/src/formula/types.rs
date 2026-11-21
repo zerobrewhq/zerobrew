@@ -159,6 +159,10 @@ pub struct Formula {
     /// Homebrew's declarative post-install steps, run after linking.
     #[serde(default)]
     pub post_install_steps: Vec<PostInstallStep>,
+    /// Text Homebrew shows after installing, with `{{token}}` paths like the
+    /// post-install steps.
+    #[serde(default)]
+    pub caveats: Option<String>,
 }
 
 impl Formula {
@@ -347,6 +351,25 @@ mod tests {
             assert!(!formula.versions.stable.is_empty());
             assert!(!formula.bottle.stable.files.is_empty());
         }
+    }
+
+    #[test]
+    fn caveats_deserialize_from_string_or_null() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(include_str!("../../fixtures/formula_foo.json")).unwrap();
+        let formula: Formula = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(formula.caveats, None);
+
+        json["caveats"] = serde_json::Value::Null;
+        let formula: Formula = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(formula.caveats, None);
+
+        json["caveats"] = "Add {{opt_prefix}}/bin to PATH".into();
+        let formula: Formula = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            formula.caveats.as_deref(),
+            Some("Add {{opt_prefix}}/bin to PATH")
+        );
     }
 
     #[test]
