@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use zb_io::{InstallProgress, ProgressCallback};
 
-use crate::ui::StdUi;
+use crate::ui::{StdUi, Ui};
 use crate::utils::{normalize_formula_name, suggest_homebrew, suggest_missing_formula_matches};
 
 pub async fn execute(
@@ -43,6 +43,7 @@ pub async fn execute(
     let mut installed_count = 0usize;
     let mut notices = Vec::new();
     let mut post_install_failures = Vec::new();
+    let mut caveats = Vec::new();
 
     if !normalized_names.is_empty() {
         let plan = match installer
@@ -66,6 +67,7 @@ pub async fn execute(
         installed_count += result.installed;
         notices.extend(result.notices);
         post_install_failures.extend(result.post_install_failures);
+        caveats.extend(result.caveats);
     }
 
     if !cask_names.is_empty() {
@@ -87,7 +89,25 @@ pub async fn execute(
     ))
     .map_err(ui_error)?;
 
+    report_caveats(ui, &caveats).map_err(ui_error)?;
     report_post_install(ui, &notices, post_install_failures)
+}
+
+/// Print each formula's caveats under one `Caveats` heading, as Homebrew
+/// does after an install.
+pub fn report_caveats<O: std::io::Write, E: std::io::Write>(
+    ui: &mut Ui<O, E>,
+    caveats: &[zb_io::FormulaCaveats],
+) -> std::io::Result<()> {
+    if caveats.is_empty() {
+        return Ok(());
+    }
+    ui.heading("Caveats")?;
+    for caveat in caveats {
+        ui.heading(style(&caveat.name).bold())?;
+        ui.println(&caveat.text)?;
+    }
+    Ok(())
 }
 
 /// Print post-install notices and failures. Every package is installed and
@@ -328,5 +348,49 @@ pub async fn execute_formula_plan(
 fn ui_error(err: std::io::Error) -> zb_core::Error {
     zb_core::Error::FileError {
         message: format!("failed to write CLI output: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caveats_are_printed_per_formula_under_one_heading() {
+        let mut out = Vec::new();
+        let mut ui = Ui::with_writers(&mut out, std::io::sink());
+        report_caveats(
+            &mut ui,
+            &[
+                zb_io::FormulaCaveats {
+                    name: "openssl@3".into(),
+                    text: "A CA file is in /opt/zerobrew/etc/openssl@3".into(),
+                },
+                zb_io::FormulaCaveats {
+                    name: "libpq".into(),
+                    text: "libpq is keg-only.".into(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let out = console::strip_ansi_codes(&String::from_utf8(out).unwrap()).into_owned();
+        assert_eq!(out.matches("Caveats").count(), 1);
+        let openssl = out.find("openssl@3\n").unwrap();
+        let ca = out
+            .find("A CA file is in /opt/zerobrew/etc/openssl@3")
+            .unwrap();
+        let libpq = out.find("libpq\n").unwrap();
+        assert!(out.find("Caveats").unwrap() < openssl);
+        assert!(openssl < ca && ca < libpq);
+        assert!(out.ends_with("libpq is keg-only.\n"));
+    }
+
+    #[test]
+    fn no_caveats_print_nothing() {
+        let mut out = Vec::new();
+        let mut ui = Ui::with_writers(&mut out, std::io::sink());
+        report_caveats(&mut ui, &[]).unwrap();
+        assert!(out.is_empty());
     }
 }

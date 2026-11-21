@@ -191,6 +191,7 @@ pub async fn execute(
     let mut errors: Vec<(String, zb_core::Error)> = Vec::new();
     let mut notices = Vec::new();
     let mut post_install_failures = Vec::new();
+    let mut caveats = Vec::new();
 
     for pkg in &outdated {
         let name = &pkg.name;
@@ -210,6 +211,7 @@ pub async fn execute(
                 upgraded += 1;
                 notices.extend(result.notices);
                 post_install_failures.extend(result.post_install_failures);
+                caveats.extend(result.caveats);
             }
             Err(e) => {
                 ui.step_fail().map_err(ui_error)?;
@@ -242,6 +244,7 @@ pub async fn execute(
             elapsed.as_secs_f64()
         ))
         .map_err(ui_error)?;
+        super::install::report_caveats(ui, &caveats).map_err(ui_error)?;
         super::install::report_post_install(ui, &notices, post_install_failures)
     } else if !errors.is_empty() {
         Err(errors.remove(0).1)

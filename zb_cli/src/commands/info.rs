@@ -1,12 +1,21 @@
 use chrono::{DateTime, Local};
 use console::style;
 
-pub fn execute(installer: &mut zb_io::Installer, formula: String) -> Result<(), zb_core::Error> {
+pub async fn execute(
+    installer: &mut zb_io::Installer,
+    formula: String,
+) -> Result<(), zb_core::Error> {
     if let Some(keg) = installer.get_installed(&formula) {
         print_field("Name:", style(&keg.name).bold());
         print_field("Version:", &keg.version);
         print_field("Store key:", &keg.store_key[..12]);
         print_field("Installed:", format_timestamp(keg.installed_at));
+        // Caveats need the formula from the API; offline, info still works without them.
+        if let Ok(Some(caveats)) = installer.installed_caveats(&keg.name).await {
+            println!();
+            println!("{}", style("Caveats:").dim());
+            println!("{}", caveats.text);
+        }
     } else {
         println!("Formula '{}' is not installed.", formula);
     }
