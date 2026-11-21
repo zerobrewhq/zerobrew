@@ -9,7 +9,7 @@ pub use homebrew::{
 };
 pub use install::doctor::{DiagnosticReport, RepairSummary};
 pub use install::{
-    ExecuteResult, InstallPlan, Installer, OutdatedPackage, PlanFailure, PostInstallNotice,
-    create_installer,
+    ExecuteResult, FormulaCaveats, InstallPlan, Installer, OutdatedPackage, PlanFailure,
+    PostInstallNotice, create_installer,
 };
-pub use post_install::{PostInstallContext, StepError, StepFailure, run_steps};
+pub use post_install::{PostInstallContext, StepError, StepFailure, expand_caveats, run_steps};

@@ -87,6 +87,15 @@ pub struct ExecuteResult {
     /// Packages whose post-install steps failed. Each is installed and
     /// linked; the steps can be retried with `zb postinstall`.
     pub post_install_failures: Vec<Error>,
+    /// Caveats of the installed formulae, with their paths filled in.
+    pub caveats: Vec<FormulaCaveats>,
+}
+
+/// A formula's caveats, shown after install as Homebrew does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormulaCaveats {
+    pub name: String,
+    pub text: String,
 }
 
 /// A message a formula's post-install asked to show.
@@ -310,6 +319,10 @@ impl Installer {
         finished.sort_by_key(|item| positions.get(&item.install_name).copied());
         let mut notices = Vec::new();
         let mut post_install_failures = Vec::new();
+        let caveats = finished
+            .iter()
+            .filter_map(|item| self.formula_caveats(&item.formula))
+            .collect();
         for item in finished {
             if item.formula.post_install_steps.is_empty() {
                 continue;
@@ -342,6 +355,7 @@ impl Installer {
             installed,
             notices,
             post_install_failures,
+            caveats,
         })
     }
 
@@ -361,6 +375,7 @@ impl Installer {
             result
                 .post_install_failures
                 .extend(executed.post_install_failures);
+            result.caveats.extend(executed.caveats);
         }
 
         if !casks.is_empty() {
@@ -1063,6 +1078,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn install_returns_caveats_with_paths_expanded() {
+        let mock_server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+        let bottle = create_bottle_tarball("kegonly");
+        let caveats = r#""caveats": "Put it first in PATH:\n  {{opt_prefix}}/bin\nCerts are in $HOMEBREW_PREFIX/etc\n""#;
+        let (mut installer, _root, prefix) =
+            installer_for_bottle_with(&mock_server, &tmp, "kegonly", bottle, caveats).await;
+
+        let result = installer
+            .install(&["kegonly".to_string()], true)
+            .await
+            .unwrap();
+
+        let prefix = prefix.display();
+        assert_eq!(
+            result.caveats,
+            vec![super::FormulaCaveats {
+                name: "kegonly".into(),
+                text: format!(
+                    "Put it first in PATH:\n  {prefix}/opt/kegonly/bin\nCerts are in {prefix}/etc"
+                ),
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn formulae_without_steps_report_nothing() {
         let mock_server = MockServer::start().await;
         let tmp = TempDir::new().unwrap();
@@ -1075,6 +1116,7 @@ mod tests {
             .unwrap();
         assert!(result.notices.is_empty());
         assert!(result.post_install_failures.is_empty());
+        assert!(result.caveats.is_empty());
     }
 
     #[tokio::test]

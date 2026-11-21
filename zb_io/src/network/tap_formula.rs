@@ -405,6 +405,7 @@ pub fn parse_tap_formula_ruby(spec: &TapFormulaRef, source: &str) -> Result<Form
         aliases: Vec::new(),
         oldnames: Vec::new(),
         post_install_steps: Vec::new(),
+        caveats: None,
     })
 }
 

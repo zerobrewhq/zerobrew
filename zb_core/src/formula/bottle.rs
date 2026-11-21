@@ -331,6 +331,7 @@ mod tests {
             aliases: Vec::new(),
             oldnames: Vec::new(),
             post_install_steps: Vec::new(),
+            caveats: None,
         };
 
         let selected = select_bottle(&formula).unwrap();
@@ -374,6 +375,7 @@ mod tests {
             aliases: Vec::new(),
             oldnames: Vec::new(),
             post_install_steps: Vec::new(),
+            caveats: None,
         };
 
         let err = select_bottle(&formula).unwrap_err();
@@ -419,6 +421,7 @@ mod tests {
             aliases: Vec::new(),
             oldnames: Vec::new(),
             post_install_steps: Vec::new(),
+            caveats: None,
         };
 
         let err = select_bottle(&formula).unwrap_err();
@@ -507,6 +510,7 @@ mod tests {
             aliases: Vec::new(),
             oldnames: Vec::new(),
             post_install_steps: Vec::new(),
+            caveats: None,
         };
 
         let selected = select_bottle_with_version(&formula, Some(15)).unwrap();
@@ -561,6 +565,7 @@ mod tests {
             aliases: Vec::new(),
             oldnames: Vec::new(),
             post_install_steps: Vec::new(),
+            caveats: None,
         };
 
         let selected = select_bottle_with_version(&formula, Some(26)).unwrap();
