@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Running `zb` with no arguments now shows the help when `ZEROBREW_ROOT` or `ZEROBREW_AUTO_INIT` is set, as it is after `zb init`, instead of a missing-subcommand error ([#357](https://github.com/zerobrewhq/zerobrew/issues/357), [#479](https://github.com/zerobrewhq/zerobrew/pull/479))
 - `zb doctor` no longer reports packages built from source as stale store refs that are `not on disk`, and `zb doctor --repair` no longer fails to clear them. A source build goes straight into the Cellar, so it has no store entry to find. Refcount mismatches on source builds are still reported and repaired ([#483](https://github.com/zerobrewhq/zerobrew/issues/483), [#484](https://github.com/zerobrewhq/zerobrew/pull/484))
+- `zb migrate` no longer stops before migrating anything when one installed Homebrew formula has been removed from homebrew-core, such as `python@3.8`. Formulae `brew info` cannot find are skipped and listed, and the rest are migrated ([#502](https://github.com/zerobrewhq/zerobrew/issues/502))
 
 ### Security
 - Update `zstd` to 0.14.3, with `zstd-safe` 8.2.0 and `zstd-sys` 2.1.2, for RUSTSEC-2026-0391, 0398, 0403 and 0410. zerobrew only uses the streaming decoder, on bottles and sources it has checksummed ([#485](https://github.com/zerobrewhq/zerobrew/pull/485))
