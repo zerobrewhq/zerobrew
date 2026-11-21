@@ -22,6 +22,8 @@ pub struct HomebrewMigrationPackages {
     pub non_core_formulas: Vec<HomebrewPackage>,
     /// Cask packages that cannot be migrated
     pub casks: Vec<HomebrewPackage>,
+    /// Leaves `brew info` could not resolve, e.g. formulae removed upstream
+    pub unresolved: Vec<String>,
 }
 
 /// Parse Homebrew formulas from JSON output of `brew info --json=v1 --installed`
@@ -97,7 +99,58 @@ pub fn categorize_packages(packages: Vec<HomebrewPackage>) -> HomebrewMigrationP
         formulas,
         non_core_formulas,
         casks,
+        unresolved: Vec::new(),
     }
+}
+
+fn brew_info(brew: &Path, names: &[String]) -> Result<Vec<HomebrewPackage>, Error> {
+    let output = Command::new(brew)
+        .args(["info", "--json=v1"])
+        .args(names)
+        .output()
+        .map_err(Error::exec("failed to run 'brew info'"))?;
+
+    if !output.status.success() {
+        return Err((Error::exec("brew info failed"))(String::from_utf8_lossy(
+            &output.stderr,
+        )));
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(Error::exec("failed to parse brew info JSON"))?;
+    Ok(parse_formulas_from_json(&json))
+}
+
+/// Look up the leaves with `brew info`, returning the formulae it resolved and
+/// the names it could not.
+///
+/// One unknown name fails the whole batch call (an installed formula that was
+/// since removed from homebrew-core, say), so on failure each leaf is retried alone.
+pub fn resolve_leaves(
+    brew: &Path,
+    leaves: &[String],
+) -> Result<(Vec<HomebrewPackage>, Vec<String>), Error> {
+    if leaves.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let batch_err = match brew_info(brew, leaves) {
+        Ok(formulas) => return Ok((formulas, Vec::new())),
+        Err(e) => e,
+    };
+
+    let mut formulas = Vec::new();
+    let mut unresolved = Vec::new();
+    for leaf in leaves {
+        match brew_info(brew, std::slice::from_ref(leaf)) {
+            Ok(found) => formulas.extend(found),
+            Err(_) => unresolved.push(leaf.clone()),
+        }
+    }
+    // Every leaf failing means brew itself is broken, not one stale formula.
+    if formulas.is_empty() {
+        return Err(batch_err);
+    }
+    Ok((formulas, unresolved))
 }
 
 /// Get all installed Homebrew packages, categorized for migration
@@ -119,26 +172,7 @@ pub fn get_homebrew_packages(brew: &Path) -> Result<HomebrewMigrationPackages, E
 
     let leaves = parse_leaves_from_plain_text(&String::from_utf8_lossy(&leaves_output.stdout));
 
-    let formulas = if leaves.is_empty() {
-        Vec::new()
-    } else {
-        let formulas_output = Command::new(brew)
-            .args(["info", "--json=v1"])
-            .args(&leaves)
-            .output()
-            .map_err(Error::exec("failed to run 'brew info'"))?;
-
-        if !formulas_output.status.success() {
-            return Err((Error::exec("brew info failed"))(String::from_utf8_lossy(
-                &formulas_output.stderr,
-            )));
-        }
-
-        let formulas_json: serde_json::Value = serde_json::from_slice(&formulas_output.stdout)
-            .map_err(Error::exec("failed to parse brew info JSON"))?;
-
-        parse_formulas_from_json(&formulas_json)
-    };
+    let (formulas, unresolved) = resolve_leaves(brew, &leaves)?;
 
     let casks_output = Command::new(brew)
         .args(["list", "--cask"])
@@ -154,7 +188,9 @@ pub fn get_homebrew_packages(brew: &Path) -> Result<HomebrewMigrationPackages, E
     let casks = parse_casks_from_plain_text(&String::from_utf8_lossy(&casks_output.stdout));
 
     let all_packages: Vec<HomebrewPackage> = formulas.into_iter().chain(casks).collect();
-    Ok(categorize_packages(all_packages))
+    let mut packages = categorize_packages(all_packages);
+    packages.unresolved = unresolved;
+    Ok(packages)
 }
 
 /// Resolve and pin the PATH entry before migration can install or uninstall anything.
@@ -218,6 +254,50 @@ mod tests {
         );
         fs::write(&brew, "#!/bin/sh\nprintf 'Homebrew 7.0.0\\n'\n").unwrap();
         validate_homebrew(&brew).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_leaves_skips_formulae_brew_info_cannot_find() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let brew = dir.path().join("brew");
+        // Fake brew: any request naming python@3.8 fails, like a formula removed upstream.
+        fs::write(
+            &brew,
+            r#"#!/bin/sh
+shift 2
+for n in "$@"; do
+  if [ "$n" = "python@3.8" ]; then
+    echo 'Error: No available formula with the name "python@3.8".' >&2
+    exit 1
+  fi
+done
+printf '['
+sep=''
+for n in "$@"; do printf '%s{"name":"%s","tap":"homebrew/core"}' "$sep" "$n"; sep=','; done
+printf ']'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&brew, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let leaves = vec![
+            "git".to_string(),
+            "python@3.8".to_string(),
+            "jq".to_string(),
+        ];
+        let (formulas, unresolved) = resolve_leaves(&brew, &leaves).unwrap();
+        let names: Vec<_> = formulas.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["git", "jq"]);
+        assert_eq!(unresolved, vec!["python@3.8"]);
+
+        let (formulas, unresolved) = resolve_leaves(&brew, &leaves[..1]).unwrap();
+        assert_eq!(formulas.len(), 1);
+        assert!(unresolved.is_empty());
+
+        let err = resolve_leaves(&brew, &leaves[1..2]).unwrap_err();
+        assert!(err.to_string().contains("brew info failed"));
     }
 
     #[test]
