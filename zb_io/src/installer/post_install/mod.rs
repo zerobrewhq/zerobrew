@@ -87,6 +87,20 @@ impl fmt::Display for StepFailure {
     }
 }
 
+/// Fill in the paths in a formula's caveats. The API writes them with
+/// Homebrew's placeholders (`$HOMEBREW_PREFIX`, `$HOMEBREW_CELLAR`, `/$HOME`),
+/// replaced as `Formulary.replace_placeholders` does; `{{token}}`s are expanded too.
+pub fn expand_caveats(ctx: &PostInstallContext, text: &str) -> String {
+    let mut text = text
+        .replace("$HOMEBREW_PREFIX", &ctx.prefix.display().to_string())
+        .replace("$HOMEBREW_CELLAR", &ctx.cellar.display().to_string());
+    if let Some(home) = std::env::var_os("HOME") {
+        text = text.replace("/$HOME", &home.to_string_lossy());
+    }
+    // A token that cannot be resolved (`{{user}}` with USER unset) leaves the text as is.
+    template::expand(ctx, &text).unwrap_or(text)
+}
+
 /// Run `steps` in order. Returns the messages of any `warn` steps.
 ///
 /// Guard results are remembered for the whole run, as Homebrew does: a
@@ -183,6 +197,29 @@ mod tests {
             action: StepAction::MkdirP {
                 path: PathSpec::absolute(path),
             },
+        }
+    }
+
+    #[test]
+    fn caveats_expand_homebrew_placeholders_and_tokens() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = context(tmp.path(), "openssl@3", "3.6.0");
+        let prefix = ctx.prefix.display().to_string();
+        let cellar = ctx.cellar.display().to_string();
+        let text = "place .pem files in\n  $HOMEBREW_PREFIX/etc/openssl@3/certs\n\
+                    keg: $HOMEBREW_CELLAR/openssl@3\nopt: {{opt_prefix}}\nshell: $(brew --prefix)";
+        assert_eq!(
+            expand_caveats(&ctx, text),
+            format!(
+                "place .pem files in\n  {prefix}/etc/openssl@3/certs\n\
+                 keg: {cellar}/openssl@3\nopt: {prefix}/opt/openssl@3\nshell: $(brew --prefix)"
+            )
+        );
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(
+                expand_caveats(&ctx, "edit /$HOME/.zshrc"),
+                format!("edit {}/.zshrc", home.to_string_lossy())
+            );
         }
     }
 
