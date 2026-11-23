@@ -8,8 +8,9 @@ Usage: brew <command> [args...]
 
 Supported commands: install, uninstall, list, info, outdated, upgrade, doctor,
 bundle, update, cleanup (zerobrew gc only).
-Only arguments supported by zb are accepted. Cask/formula filters and search
-are not implemented. Package information and output follow zb's semantics.
+Only arguments supported by zb are accepted, including `install --cask`.
+`list --cask`, `list --formula`, and search are not implemented.
+Package information and output follow zb's semantics.
 Use `brew <command> --help` for supported arguments.
 Remove this entrypoint with `zb install-alias brew --remove`.";
 

@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `zb install --cask <token>` installs supported binary casks using Homebrew-style syntax. The opt-in `brew` entrypoint accepts `brew install --cask`, too. Existing `cask:<token>` and `homebrew/cask/<token>` forms still work, and cask artifact support is unchanged ([#486](https://github.com/zerobrewhq/zerobrew/issues/486))
 - `zb man --out-dir <dir>` writes zerobrew's man pages, generated from its command-line definition: `zb.1` and a `zb-<subcommand>.1` for each subcommand. The installer writes them to `share/man/man1` beside the directory it installs `zb` into, or to `ZEROBREW_MAN_DIR`, so `man zb` works after installing. A failure there is a warning, not a failed install ([#349](https://github.com/zerobrewhq/zerobrew/issues/349), [#466](https://github.com/zerobrewhq/zerobrew/pull/466))
 
 ### Changed

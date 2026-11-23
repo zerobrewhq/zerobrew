@@ -47,6 +47,9 @@ fn forwards_to_adjacent_zb_and_preserves_arguments_status_and_signal() {
         .args(["install", "a b", "c", "--no-link"]));
     assert_eq!(output.status.code(), Some(17));
     assert_eq!(output.stdout, b"install\na b\nc\n--no-link\n");
+    let output = run(Command::new(&brew).args(["install", "--cask", "codex", "--no-link"]));
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"install\n--cask\ncodex\n--no-link\n");
     let output = run(Command::new(&brew).args(["cleanup"]));
     assert!(output.status.success());
     assert_eq!(output.stdout, b"gc\n");
@@ -63,7 +66,6 @@ fn unsupported_commands_and_flags_fail_before_executing_zb() {
     for args in [
         vec!["search", "jq"],
         vec!["services", "list"],
-        vec!["install", "--cask", "foo"],
         vec!["list", "--formula"],
         vec!["list", "--cask"],
         vec!["cleanup", "--prune=all"],
