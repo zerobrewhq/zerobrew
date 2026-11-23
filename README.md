@@ -85,13 +85,15 @@ The entrypoint supports `install`, `uninstall`, `list`, `info`, `outdated`,
 `upgrade`, `doctor`, `bundle`, and `update`, using the arguments and output
 supported by `zb`. `cleanup` runs `zb gc` and only removes unreferenced store
 entries. `update` refreshes the formula index; it does not update zerobrew itself.
-Commands such as `search`, `services`, and `tap`, and flags such as `--cask` and
-`list --formula`, are not implemented and fail with a compatibility error.
+`brew install --cask` works for supported binary casks. Commands such as
+`search`, `services`, and `tap`, and list filters `--cask` and `--formula`, are
+not implemented and fail with a compatibility error.
 `zb migrate` requires real Homebrew on PATH and refuses this entrypoint.
 
 ```bash
 zb install jq                   # install one package
 zb install wget git             # install multiple
+zb install --cask codex         # install a supported binary cask
 zb bundle                       # install from Brewfile
 zb bundle install -f myfile     # install from custom file
 zb bundle dump                  # export installed packages to Brewfile

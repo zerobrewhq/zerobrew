@@ -136,6 +136,19 @@ fn assert_stdout_contains(output: &Output, needle: &str) {
     );
 }
 
+#[test]
+fn install_cask_validates_all_targets_before_installing() {
+    let t = TestEnv::new();
+    let output = t.zb(&["install", "--cask", "codex", ""]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("expected a Homebrew cask token"),
+        "{stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Installing"));
+}
+
 fn assert_no_installed_symlinks(dir: &std::path::Path) {
     if !dir.exists() {
         return;

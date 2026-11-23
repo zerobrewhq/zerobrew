@@ -5,7 +5,7 @@ use zb_cli::{
     init::ensure_init,
     logging,
     ui::Ui,
-    utils::{get_prefix_path, get_root_path},
+    utils::{get_prefix_path, get_root_path, normalize_cask_target},
 };
 use zb_io::create_installer;
 
@@ -55,9 +55,18 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
         Commands::Man { out_dir: _ } => unreachable!(),
         Commands::Install {
             formulas,
+            cask,
             no_link,
             build_from_source,
         } => {
+            let formulas = if cask {
+                formulas
+                    .iter()
+                    .map(|target| normalize_cask_target(target))
+                    .collect::<Result<_, _>>()?
+            } else {
+                formulas
+            };
             commands::install::execute(
                 &mut installer,
                 formulas,

@@ -34,6 +34,24 @@ pub fn normalize_formula_name(name: &str) -> Result<String, zb_core::Error> {
     Ok(trimmed.to_string())
 }
 
+pub fn normalize_cask_target(target: &str) -> Result<String, zb_core::Error> {
+    let trimmed = target.trim();
+    let token = trimmed
+        .strip_prefix("cask:")
+        .or_else(|| trimmed.strip_prefix("homebrew/cask/"))
+        .unwrap_or(trimmed);
+    if token.is_empty()
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_+-.@".contains(&b))
+    {
+        return Err(zb_core::Error::InvalidArgument {
+            message: format!("expected a Homebrew cask token, got {target:?}"),
+        });
+    }
+    Ok(format!("cask:{token}"))
+}
+
 pub fn format_formula_suggestions(requested: &str, suggestions: &[String]) -> Option<String> {
     if suggestions.is_empty() {
         return None;
@@ -193,8 +211,8 @@ mod tests {
     use zb_io::{Installer, Linker};
 
     use super::{
-        format_formula_suggestions, get_prefix_path_for_os, normalize_formula_name,
-        suggest_missing_formula_matches,
+        format_formula_suggestions, get_prefix_path_for_os, normalize_cask_target,
+        normalize_formula_name, suggest_missing_formula_matches,
     };
 
     #[test]
@@ -268,6 +286,40 @@ mod tests {
             normalize_formula_name("homebrew/cask/docker-desktop").unwrap(),
             "cask:docker-desktop".to_string()
         );
+    }
+
+    #[test]
+    fn normalize_cask_target_accepts_bare_and_prefixed_tokens() {
+        for target in [" codex ", "cask:codex", "homebrew/cask/codex"] {
+            assert_eq!(normalize_cask_target(target).unwrap(), "cask:codex");
+        }
+        assert_eq!(
+            normalize_cask_target("codex@beta").unwrap(),
+            "cask:codex@beta"
+        );
+    }
+
+    #[test]
+    fn normalize_cask_target_rejects_empty_or_invalid_tokens() {
+        for target in [
+            "",
+            "  ",
+            "cask:",
+            "homebrew/cask/",
+            "homebrew/core/jq",
+            "user/tap/codex",
+            "cask:cask:codex",
+            "codex beta",
+            "codex?other",
+        ] {
+            assert!(
+                matches!(
+                    normalize_cask_target(target),
+                    Err(zb_core::Error::InvalidArgument { .. })
+                ),
+                "accepted {target:?}"
+            );
+        }
     }
 
     #[test]

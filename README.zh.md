@@ -85,13 +85,15 @@ curl -fsSL https://zerobrew.rs/install | bash -s -- --brew-compat
 兼容入口支持 `install`、`uninstall`、`list`、`info`、`outdated`、`upgrade`、
 `doctor`、`bundle` 和 `update`，参数与输出沿用 `zb`。
 `cleanup` 对应 `zb gc`，只清理未引用的 store 条目；`update` 只刷新软件包索引，
-不会更新 zerobrew 本身。`search`、`services`、`tap` 等命令，以及 `--cask`、
-`list --formula` 等参数暂不支持，会明确报错。
+不会更新 zerobrew 本身。`brew install --cask` 可以安装受支持的二进制 cask。
+`search`、`services`、`tap` 等命令，以及 `list --cask`、`list --formula`
+等过滤参数暂不支持，会明确报错。
 `zb migrate` 需要 PATH 中的真实 Homebrew，不能通过该兼容入口执行迁移。
 
 ```bash
 zb install jq                   # 安装单个软件包
 zb install wget git             # 安装多个软件包
+zb install --cask codex         # 安装受支持的二进制 cask
 zb bundle                       # 从 Brewfile 安装
 zb bundle install -f myfile     # 从自定义文件安装
 zb bundle dump                  # 将已安装的软件包导出到 Brewfile

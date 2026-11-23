@@ -82,7 +82,7 @@ fn parse_concurrency(value: &str) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
+    use super::{Cli, Commands};
     use clap::{Parser, error::ErrorKind};
 
     #[test]
@@ -163,6 +163,55 @@ mod tests {
         let result = Cli::try_parse_from(["zb", "outdated", "--verbose", "--json"]);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn install_parses_cask_flag_and_targets() {
+        for (args, targets, expect_cask, expect_no_link) in [
+            (&["--cask", "codex"][..], &["codex"][..], true, false),
+            (
+                &["codex", "claude-code", "--cask", "--no-link"],
+                &["codex", "claude-code"],
+                true,
+                true,
+            ),
+            (
+                &["jq", "homebrew/cask/codex", "cask:claude-code"],
+                &["jq", "homebrew/cask/codex", "cask:claude-code"],
+                false,
+                false,
+            ),
+        ] {
+            let cli =
+                Cli::try_parse_args(["zb", "install"].into_iter().chain(args.iter().copied()))
+                    .unwrap();
+            let Commands::Install {
+                formulas,
+                cask,
+                no_link,
+                ..
+            } = cli.command
+            else {
+                panic!("expected install command");
+            };
+            assert_eq!(formulas, targets);
+            assert_eq!(cask, expect_cask);
+            assert_eq!(no_link, expect_no_link);
+        }
+    }
+
+    #[test]
+    fn install_rejects_cask_with_source_build_or_without_targets() {
+        for flag in ["-s", "--build-from-source"] {
+            let err = Cli::try_parse_args(["zb", "install", "--cask", flag, "codex"])
+                .err()
+                .unwrap();
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        }
+        let err = Cli::try_parse_args(["zb", "install", "--cask"])
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
 }
 
 #[derive(Subcommand)]
@@ -178,6 +227,12 @@ pub enum Commands {
     Install {
         #[arg(required = true, num_args = 1..)]
         formulas: Vec<String>,
+        #[arg(
+            long,
+            conflicts_with = "build_from_source",
+            help = "Treat all package arguments as casks"
+        )]
+        cask: bool,
         #[arg(long, help = "Do not create symlinks after installation")]
         no_link: bool,
         #[arg(long, short = 's', help = "Build from source instead of using bottles")]
