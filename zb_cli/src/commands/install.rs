@@ -136,6 +136,34 @@ pub async fn execute_formula_plan(
     no_link: bool,
     ui: &mut StdUi,
 ) -> Result<zb_io::ExecuteResult, zb_core::Error> {
+    execute_formula_plan_tracking(
+        installer,
+        requested_formulas,
+        plan,
+        no_link,
+        ui,
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .await
+}
+
+/// Push the name of a package whose post-install failed onto `failed`.
+fn note_post_install_failure(failed: &Mutex<Vec<String>>, event: &InstallProgress) {
+    if let InstallProgress::PostInstallFailed { name, .. } = event {
+        failed.lock().unwrap().push(name.clone());
+    }
+}
+
+/// Like `execute_formula_plan`, and records every package whose post-install
+/// failed in `post_install_failed`, including when the install errors overall.
+pub async fn execute_formula_plan_tracking(
+    installer: &mut zb_io::Installer,
+    requested_formulas: &[String],
+    plan: zb_io::InstallPlan,
+    no_link: bool,
+    ui: &mut StdUi,
+    post_install_failed: Arc<Mutex<Vec<String>>>,
+) -> Result<zb_io::ExecuteResult, zb_core::Error> {
     ui.heading(format!(
         "Resolving dependencies ({} packages)...",
         plan.items.len()
@@ -177,6 +205,7 @@ pub async fn execute_formula_plan(
     let done_style_clone = done_style.clone();
 
     let progress_callback: Arc<ProgressCallback> = Arc::new(Box::new(move |event| {
+        note_post_install_failure(&post_install_failed, &event);
         let mut bars = bars_clone.lock().unwrap();
         match event {
             InstallProgress::DownloadStarted { name, total_bytes } => {
@@ -328,5 +357,30 @@ pub async fn execute_formula_plan(
 fn ui_error(err: std::io::Error) -> zb_core::Error {
     zb_core::Error::FileError {
         message: format!("failed to write CLI output: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_only_post_install_failures() {
+        let failed = Mutex::new(Vec::new());
+        for event in [
+            InstallProgress::PostInstallStarted {
+                name: "php".to_string(),
+            },
+            InstallProgress::PostInstallFailed {
+                name: "php".to_string(),
+                message: "boom".to_string(),
+            },
+            InstallProgress::PostInstallCompleted {
+                name: "wget".to_string(),
+            },
+        ] {
+            note_post_install_failure(&failed, &event);
+        }
+        assert_eq!(*failed.lock().unwrap(), vec!["php"]);
     }
 }

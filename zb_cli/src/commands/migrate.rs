@@ -99,20 +99,26 @@ pub async fn execute(
         ui.blank_line().map_err(ui_error)?;
     }
 
+    let post_install_failed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     if !plan.items.is_empty() {
-        crate::commands::install::execute_formula_plan(
+        crate::commands::install::execute_formula_plan_tracking(
             installer,
             &formula_names,
             plan,
             false, // no_link
             ui,
+            post_install_failed.clone(),
         )
         .await
         .ok();
     }
+    let post_install_failed = post_install_failed.lock().unwrap().clone();
 
-    let (successfully_installed, failed_installed) =
-        check_install_status(installer, &formula_names)?;
+    let InstallStatus {
+        migrated: successfully_installed,
+        not_installed: failed_installed,
+        post_install_incomplete,
+    } = check_install_status(installer, &formula_names, &post_install_failed)?;
     let success_count = successfully_installed.len();
 
     ui.blank_line().map_err(ui_error)?;
@@ -132,6 +138,20 @@ pub async fn execute(
         for name in &failed_installed {
             ui.bullet(name).map_err(ui_error)?;
         }
+        ui.blank_line().map_err(ui_error)?;
+    }
+
+    if !post_install_incomplete.is_empty() {
+        ui.note(format!(
+            "{} formula(s) installed but their post-install steps did not finish, so they were not counted as migrated and will stay in Homebrew:",
+            post_install_incomplete.len()
+        ))
+        .map_err(ui_error)?;
+        for name in &post_install_incomplete {
+            ui.bullet(name).map_err(ui_error)?;
+        }
+        ui.println("Retry with `zb postinstall <formula>`.")
+            .map_err(ui_error)?;
         ui.blank_line().map_err(ui_error)?;
     }
 
@@ -234,14 +254,21 @@ pub async fn execute(
     Ok(())
 }
 
-// FIXME: Abstract this return type to a more structured type (e.g., a struct)
+/// Where each requested formula ended up. Only `migrated` is safe to
+/// uninstall from Homebrew.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct InstallStatus {
+    migrated: Vec<String>,
+    not_installed: Vec<String>,
+    /// Installed, but post-install steps did not finish.
+    post_install_incomplete: Vec<String>,
+}
+
 fn check_install_status(
     installer: &zb_io::Installer,
     formula_names: &[String],
-) -> Result<(Vec<String>, Vec<String>), zb_core::Error> {
-    let mut successfully_installed = Vec::new();
-    let mut failed_installed = Vec::new();
-
+    post_install_failed: &[String],
+) -> Result<InstallStatus, zb_core::Error> {
     let installed_kegs =
         installer
             .list_installed()
@@ -251,19 +278,53 @@ fn check_install_status(
 
     let installed_names: std::collections::HashSet<String> =
         installed_kegs.into_iter().map(|k| k.name).collect();
+    Ok(partition_install_status(
+        formula_names,
+        &installed_names,
+        post_install_failed,
+    ))
+}
+
+fn partition_install_status(
+    formula_names: &[String],
+    installed_names: &std::collections::HashSet<String>,
+    post_install_failed: &[String],
+) -> InstallStatus {
+    let mut status = InstallStatus::default();
     for name in formula_names {
         if !installed_names.contains(name) {
-            failed_installed.push(name.clone());
+            status.not_installed.push(name.clone());
+        } else if post_install_failed.contains(name) {
+            status.post_install_incomplete.push(name.clone());
         } else {
-            successfully_installed.push(name.clone());
+            status.migrated.push(name.clone());
         }
     }
-
-    Ok((successfully_installed, failed_installed))
+    status
 }
 
 fn ui_error(err: std::io::Error) -> zb_core::Error {
     zb_core::Error::StoreCorruption {
         message: format!("failed to write CLI output: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn post_install_failure_is_not_counted_as_migrated() {
+        let formulas = names(&["wget", "php", "jq"]);
+        let installed: std::collections::HashSet<String> =
+            ["wget", "php"].iter().map(|s| s.to_string()).collect();
+        let status = partition_install_status(&formulas, &installed, &names(&["php"]));
+        assert_eq!(status.migrated, names(&["wget"]));
+        assert_eq!(status.not_installed, names(&["jq"]));
+        assert_eq!(status.post_install_incomplete, names(&["php"]));
     }
 }
