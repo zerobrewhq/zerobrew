@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Homebrew tap is `zerobrewhq/tap`: `brew install zerobrewhq/tap/zerobrew`. The repository was renamed from `homebrew-zerobrew`, so taps of `zerobrewhq/zerobrew` and `cachebag/zerobrew` keep updating through GitHub's redirect
 
 ### Fixed
-- `zb migrate` no longer counts a formula whose post-install steps failed as migrated or offers to uninstall it from Homebrew. These formulae are listed separately and stay in Homebrew, and `zb postinstall <formula>` retries them ([#504](https://github.com/zerobrewhq/zerobrew/issues/504))
+- `zb migrate` no longer counts a formula whose post-install steps failed as migrated or offers to uninstall it from Homebrew. These formulae are listed separately and stay in Homebrew, and `zb postinstall <formula>` retries them ([#504](https://github.com/zerobrewhq/zerobrew/issues/504), [#508](https://github.com/zerobrewhq/zerobrew/pull/508))
 - Running `zb` with no arguments now shows the help when `ZEROBREW_ROOT` or `ZEROBREW_AUTO_INIT` is set, as it is after `zb init`, instead of a missing-subcommand error ([#357](https://github.com/zerobrewhq/zerobrew/issues/357), [#479](https://github.com/zerobrewhq/zerobrew/pull/479))
 - `zb doctor` no longer reports packages built from source as stale store refs that are `not on disk`, and `zb doctor --repair` no longer fails to clear them. A source build goes straight into the Cellar, so it has no store entry to find. Refcount mismatches on source builds are still reported and repaired ([#483](https://github.com/zerobrewhq/zerobrew/issues/483), [#484](https://github.com/zerobrewhq/zerobrew/pull/484))
 
