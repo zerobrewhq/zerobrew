@@ -12,7 +12,12 @@ pub async fn execute(
         .map_err(ui_error)?;
 
     let brew = zb_io::installer::homebrew::find_homebrew()?;
-    let packages = zb_io::get_homebrew_packages(&brew)?;
+    let packages = zb_io::get_homebrew_packages(&brew, |count| {
+        // Best effort: a failed progress line should not stop the migration.
+        let _ = ui.info(format!(
+            "brew info could not look up all leaves at once, checking {count} one by one..."
+        ));
+    })?;
 
     if packages.formulas.is_empty()
         && packages.non_core_formulas.is_empty()

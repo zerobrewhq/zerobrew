@@ -125,30 +125,32 @@ fn brew_info(brew: &Path, names: &[String]) -> Result<Vec<HomebrewPackage>, Erro
 /// the names it could not.
 ///
 /// One unknown name fails the whole batch call (an installed formula that was
-/// since removed from homebrew-core, say), so on failure each leaf is retried alone.
+/// since removed from homebrew-core, say), so on failure each leaf is retried
+/// alone. `on_retry` is told how many leaves will be looked up one by one.
 pub fn resolve_leaves(
     brew: &Path,
     leaves: &[String],
+    on_retry: impl FnOnce(usize),
 ) -> Result<(Vec<HomebrewPackage>, Vec<String>), Error> {
     if leaves.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let batch_err = match brew_info(brew, leaves) {
-        Ok(formulas) => return Ok((formulas, Vec::new())),
-        Err(e) => e,
-    };
+    if let Ok(formulas) = brew_info(brew, leaves) {
+        return Ok((formulas, Vec::new()));
+    }
 
+    on_retry(leaves.len());
     let mut formulas = Vec::new();
     let mut unresolved = Vec::new();
     for leaf in leaves {
         match brew_info(brew, std::slice::from_ref(leaf)) {
             Ok(found) => formulas.extend(found),
-            Err(_) => unresolved.push(leaf.clone()),
+            // Only skip names brew does not know; spawn, lock or network errors propagate.
+            Err(e) if e.to_string().contains("No available formula") => {
+                unresolved.push(leaf.clone())
+            }
+            Err(e) => return Err(e),
         }
-    }
-    // Every leaf failing means brew itself is broken, not one stale formula.
-    if formulas.is_empty() {
-        return Err(batch_err);
     }
     Ok((formulas, unresolved))
 }
@@ -158,7 +160,10 @@ pub fn resolve_leaves(
 /// Only formulas from `homebrew/core` can be migrated to zerobrew.
 /// Formulas from other taps and all casks are collected separately.
 /// Only leaves are migrated, as there's no use to reinstalling dependencies.
-pub fn get_homebrew_packages(brew: &Path) -> Result<HomebrewMigrationPackages, Error> {
+pub fn get_homebrew_packages(
+    brew: &Path,
+    on_retry: impl FnOnce(usize),
+) -> Result<HomebrewMigrationPackages, Error> {
     let leaves_output = Command::new(brew)
         .args(["leaves"])
         .output()
@@ -172,7 +177,7 @@ pub fn get_homebrew_packages(brew: &Path) -> Result<HomebrewMigrationPackages, E
 
     let leaves = parse_leaves_from_plain_text(&String::from_utf8_lossy(&leaves_output.stdout));
 
-    let (formulas, unresolved) = resolve_leaves(brew, &leaves)?;
+    let (formulas, unresolved) = resolve_leaves(brew, &leaves, on_retry)?;
 
     let casks_output = Command::new(brew)
         .args(["list", "--cask"])
@@ -287,17 +292,42 @@ printf ']'
             "python@3.8".to_string(),
             "jq".to_string(),
         ];
-        let (formulas, unresolved) = resolve_leaves(&brew, &leaves).unwrap();
+        let mut retried = None;
+        let (formulas, unresolved) = resolve_leaves(&brew, &leaves, |n| retried = Some(n)).unwrap();
         let names: Vec<_> = formulas.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["git", "jq"]);
         assert_eq!(unresolved, vec!["python@3.8"]);
+        assert_eq!(retried, Some(3));
 
-        let (formulas, unresolved) = resolve_leaves(&brew, &leaves[..1]).unwrap();
+        let mut retried = None;
+        let (formulas, unresolved) =
+            resolve_leaves(&brew, &leaves[..1], |n| retried = Some(n)).unwrap();
         assert_eq!(formulas.len(), 1);
         assert!(unresolved.is_empty());
+        assert_eq!(retried, None);
 
-        let err = resolve_leaves(&brew, &leaves[1..2]).unwrap_err();
-        assert!(err.to_string().contains("brew info failed"));
+        let (formulas, unresolved) = resolve_leaves(&brew, &leaves[1..2], |_| {}).unwrap();
+        assert!(formulas.is_empty());
+        assert_eq!(unresolved, vec!["python@3.8"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_leaves_propagates_other_brew_info_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let brew = dir.path().join("brew");
+        // Fake brew: fails every request with an error other than a missing formula.
+        fs::write(
+            &brew,
+            "#!/bin/sh\necho 'Error: Another active Homebrew process is already in progress.' >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&brew, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let leaves = vec!["git".to_string(), "jq".to_string()];
+        let err = resolve_leaves(&brew, &leaves, |_| {}).unwrap_err();
+        assert!(err.to_string().contains("Another active Homebrew process"));
     }
 
     #[test]
